@@ -21,4 +21,9 @@
 
 - `SKILL.md`
 - `README.md`
+- `LICENSE`
 - `solidworks-cad-skill-v1.0.0.zip`
+
+## 开源许可
+
+本项目采用 MIT License，允许使用、复制、修改、合并、发布和分发。
