@@ -13,6 +13,12 @@
 - 有界重试与回退：对证据读取、计划修订、里程碑、重规划和方向验证设置明确上限，避免流程死循环。
 - 多方向验证：从 Front、Top、Side 以及所有提供的剖视方向检查轮廓、孔、切除、材料/空腔和深度关系。
 
+## 下载
+
+- [下载 `SKILL.md`](https://github.com/tian-yu200/solidworks-cad-skill/releases/download/v1.0.0/SKILL.md)
+- [下载完整 ZIP 安装包](https://github.com/tian-yu200/solidworks-cad-skill/releases/download/v1.0.0/solidworks-cad-skill-v1.0.0.zip)
+- [查看 v1.0.0 发布页](https://github.com/tian-yu200/solidworks-cad-skill/releases/tag/v1.0.0)
+
 ## 使用方式
 
 将 `SKILL.md` 安装到你的 skill 目录，并确保运行环境提供以下九个高层 MCP 工具：
@@ -48,4 +54,4 @@ finish_job
 
 ## License
 
-暂未指定开源许可证。
+本项目采用 [MIT License](LICENSE)。
