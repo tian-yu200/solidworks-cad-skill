@@ -1,0 +1,39 @@
+{
+  "name": "solidworks-cad",
+  "version": "1.1.0",
+  "description": "Reconstruct and validate SolidWorks 3D models from orthographic, sectional, and pictorial drawings through a bundled nine-tool MCP stack.",
+  "author": {
+    "name": "tian-yu200",
+    "url": "https://github.com/tian-yu200"
+  },
+  "homepage": "https://github.com/tian-yu200/solidworks-cad-skill",
+  "repository": "https://github.com/tian-yu200/solidworks-cad-skill",
+  "license": "AGPL-3.0-only",
+  "keywords": [
+    "solidworks",
+    "cad",
+    "mcp",
+    "engineering-drawing",
+    "three-view"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "SolidWorks 工程图三维建模",
+    "shortDescription": "从三视图、剖视图和立体图重建 SolidWorks 模型",
+    "longDescription": "分析工程图投影关系和剖切结构，生成 PLAN.md，调用随包九工具 SolidWorks MCP 完成参数化建模，并从多个方向验证结果。",
+    "developerName": "tian-yu200",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/tian-yu200/solidworks-cad-skill",
+    "defaultPrompt": [
+      "根据这张工程图分析三视图并在 SolidWorks 中重建模型。",
+      "根据三视图和剖视图补全结构并生成三维模型。",
+      "验证当前模型的前视、俯视和侧视投影是否与图纸一致。"
+    ]
+  }
+}
+

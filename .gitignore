@@ -1,0 +1,15 @@
+.plugin-data/
+.runtime/
+.validation-venv/
+.codex-test-home/
+.release/
+*.log
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+plugins/solidworks-cad/mcp-server-solidworks/execution/solidworks/packages/
+plugins/solidworks-cad/mcp-server-solidworks/execution/solidworks/SolidworksExecution/bin/
+plugins/solidworks-cad/mcp-server-solidworks/execution/solidworks/SolidworksExecution/obj/

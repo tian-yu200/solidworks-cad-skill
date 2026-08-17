@@ -1,29 +1,34 @@
-# SolidWorks 工程图三维建模 Skill
+# v1.1.0 - 独立 SolidWorks MCP 插件
 
-首个公开版本，面向使用工程图证据驱动 SolidWorks 三维重建的代理工作流。
+此版本把 Skill 所需的完整开源 MCP 技术栈加入同一个可下载插件，不再依赖旧 Skill、DSH profile 或单独的 MCP 仓库。
 
-## 主要能力
+## 新增
 
-- 分析前视图、俯视图、左视图和右视图，并锁定投影方向与模型空间坐标。
-- 从多视图中匹配同一条边、角、圆孔、切口、台阶和凸台，补全缺失投影。
-- 识别立体图并优先用于判断可见拓扑、空间布局、手性和前后关系。
-- 识别全剖、半剖、阶梯剖、对齐剖、局部剖、旋转剖和移出剖。
-- 在剖视图缺线时，结合其他投影、中心、相切、连续性、孔深和特征连通性推断内部结构。
-- 建模前创建 `PLAN.md`，按里程碑记录特征顺序、方向、假设和验证结论。
-- 通过 Front、Top、Side 和所有提供的剖视图验证最终模型。
-- 使用五个带上限的重试控制点，避免证据分析、建模和重规划进入死循环。
+- Codex marketplace/plugin 结构，可直接从 GitHub 安装。
+- 随包 Python 九工具 MCP 适配器、Feature Graph 编译器和 C# SolidWorks 执行服务源码。
+- `install.ps1`：创建隔离 Python 环境、恢复依赖、查找本地 SolidWorks 并构建执行服务。
+- `start-mcp.ps1`：首次使用自动安装，之后通过 stdio 启动 MCP。
+- `doctor.ps1`：检查 Skill、MCP、Feature Graph schema、Python、执行服务、SolidWorks API 和九工具表面。
+- 插件状态、备份、依赖和构建产物写入 Codex 插件数据目录，不污染插件源码或升级缓存。
 
-## MCP 边界
+## 保留能力
 
-本 skill 仅允许九个高层 `mcp__solidworks__` 工具，并明确禁止模型直接调用 SolidWorks COM、宏、Shell、脚本、桌面自动化或旧版低级 CAD MCP。
+- 三视图方向与三维坐标锁定。
+- 跨视图边、角、孔、切口、台阶和凸台匹配。
+- 立体图优先的拓扑与前后关系判断。
+- 全剖、半剖、阶梯剖、对齐剖、局部剖、旋转剖和移出剖分析。
+- 剖视缺线条件下的内部结构推理。
+- `PLAN.md` 里程碑、有界重试和 Front/Top/Side/剖视多方向验证。
 
-## 发布内容
+## 安装要求
 
-- `SKILL.md`
-- `README.md`
-- `LICENSE`
-- `solidworks-cad-skill-v1.0.0.zip`
+用户仍需提供 Windows、合法授权的本地 SolidWorks、Python，以及 Visual Studio Build Tools 或现代 .NET SDK。SolidWorks 本体及其专有 API DLL 不随开源包分发。
 
-## 开源许可
+## 发布资产
 
-本项目采用 MIT License，允许使用、复制、修改、合并、发布和分发。
+- `solidworks-cad-plugin-v1.1.0.zip`：完整独立插件。
+- `SKILL.md`：仅代理规则，适合审阅或已有兼容 MCP 的环境。
+
+## 许可
+
+随包 MCP 源码采用 AGPL-3.0-only；Skill、集成脚本和文档采用 MIT。完整插件以 AGPL 覆盖组件的要求发布，并保留上游许可及归属。

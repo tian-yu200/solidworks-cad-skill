@@ -1,0 +1,21 @@
+{
+  "name": "solidworks-cad-skill",
+  "interface": {
+    "displayName": "SolidWorks CAD Skill"
+  },
+  "plugins": [
+    {
+      "name": "solidworks-cad",
+      "source": {
+        "source": "local",
+        "path": "./plugins/solidworks-cad"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
+
