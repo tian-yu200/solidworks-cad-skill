@@ -36,6 +36,56 @@ namespace SolidworksExecution.Controllers
             });
         }
 
+        // Cheap read-only identity probe: GET /api/tool/identity returns ONLY which document is open
+        // (activeDocument / activeDocumentPath / documentType), its isDirty flag and the current
+        // stateVersion — the identity subset of verify_state, WITHOUT walking the feature tree
+        // (SolidWorksService.GetIdentityInfo). Like /state it is a pure read: no state_version check,
+        // no increment, no idempotency registration, and it accepts no operation_id. COM calls run on
+        // the STA thread and use the cached attach. 503 + {error} when SolidWorks is not attached or
+        // no document is open — a state the caller can act on, never a 500.
+        [HttpGet]
+        [Route("identity")]
+        public HttpResponseMessage Identity()
+        {
+            Dictionary<string, object> info;
+            try
+            {
+                info = StaExecutor.Instance.Run(() => _service.GetIdentityInfo());
+            }
+            catch (System.Exception ex)
+            {
+                ExecLog.Write($"<- identity UNHANDLED {ex.GetType().Name}: {ex.Message}");
+                return Request.CreateResponse(HttpStatusCode.InternalServerError,
+                    new { error = ex.Message });
+            }
+
+            if (info.ContainsKey("error"))
+            {
+                ExecLog.Write($"<- identity UNAVAILABLE {info["error"]}");
+                return Request.CreateResponse(HttpStatusCode.ServiceUnavailable, info);
+            }
+
+            ExecLog.Write($"<- identity {info["activeDocument"]} sv={info["stateVersion"]}");
+            return Request.CreateResponse(HttpStatusCode.OK, info);
+        }
+
+        [HttpGet]
+        [Route("documents")]
+        public HttpResponseMessage Documents()
+        {
+            try
+            {
+                var info = StaExecutor.Instance.Run(() => _service.GetOpenDocumentsInfo());
+                return Request.CreateResponse(HttpStatusCode.OK, info);
+            }
+            catch (Exception ex)
+            {
+                ExecLog.Write($"<- documents UNAVAILABLE {ex.GetType().Name}: {ex.Message}");
+                return Request.CreateResponse(HttpStatusCode.ServiceUnavailable,
+                    new { error = "DOCUMENT_INVENTORY_UNAVAILABLE" });
+            }
+        }
+
         // Health endpoint (P0.6). `~/` escapes the api/tool prefix → GET /health. Reports the server is
         // up, the current state_version, and whether SolidWorks COM is currently attachable (probed on the
         // STA thread — COM_ATTACH is lazy/per-request, so this is a fresh attach attempt) plus the active
@@ -115,7 +165,7 @@ namespace SolidworksExecution.Controllers
             {
                 // All COM-touching work runs on the single dedicated STA thread (P0.1) — OWIN request
                 // threads are MTA, which made sheet-metal calls return null and add_edge_feature deadlock.
-                response = StaExecutor.Instance.Run(() => Dispatch(request));
+                response = StaExecutor.Instance.Run(() => _service.WithCommandInProgress(() => Dispatch(request)));
             }
             catch (System.Exception ex)
             {
@@ -157,6 +207,9 @@ namespace SolidworksExecution.Controllers
                 case "add_sketch_constraint":  return _service.AddSketchConstraint(request);
                 case "add_edge_feature":       return _service.AddEdgeFeature(request);
                 case "create_rib":             return _service.CreateRib(request);
+                case "create_shell":           return _service.CreateShell(request);
+                case "add_cosmetic_thread":    return _service.AddCosmeticThread(request);
+                case "add_draft":              return _service.AddDraft(request);
                 case "create_drawing":         return _service.CreateDrawing(request);
                 case "add_drawing_view":       return _service.AddDrawingView(request);
                 case "add_flat_pattern_view":  return _service.AddFlatPatternView(request);
@@ -174,6 +227,7 @@ namespace SolidworksExecution.Controllers
                 case "analyze_model":          return _service.AnalyzeModel(request);
                 case "analyze_slddrw_test":    return _service.AnalyzeDrawing(request);
                 case "get_selection":          return _service.GetSelection(request);
+                case "render_views":           return _service.RenderViews(request);
                 case "edit_sketch":            return _service.EditSketch(request);
                 case "add_reference_geometry": return _service.AddReferenceGeometry(request);
                 case "create_pattern":         return _service.CreatePattern(request);

@@ -14,11 +14,136 @@ namespace SolidworksExecution.Services
     public partial class SolidWorksService
     {
         private readonly IOperationGuard _guard;
-        private ISldWorks _solidWorks;
+        // Shared across requests on purpose. ToolController constructs a new SolidWorksService per
+        // request, so an instance field meant every tool call paid a Marshal.GetActiveObject ROT
+        // lookup (~375 ms measured). All COM access is serialized on the single StaExecutor thread,
+        // so this static needs no locking.
+        private static ISldWorks _solidWorks;
+        // Whether EnsureVisible's attach-time Visible/UserControl write succeeded for the current
+        // attach. It gates only that write. Every tool call still re-reads the live Visible property
+        // (EnsureVisiblePerRequest), because an attach-time write can fail and nothing re-attaches.
+        private static bool _sessionVisibilityApplied;
         private static readonly object UndoScopeSync = new object();
         private static bool _undoScopeActive;
         private static string _undoScopeDocumentTitle;
-        private static string _undoScopeDocumentPath;
+        // The owner's StableDocumentId. Identity rather than title or path: a part closed by hand
+        // and reopened from the same file is a new document, and the scope died with the old one.
+        private static string _undoScopeDocumentId;
+        // Retain each open document's RCW while its ID is live, so a freed COM address cannot
+        // be reused as the identity of a different document between inventory snapshots.
+        private static readonly Dictionary<IntPtr, Tuple<IModelDoc2, string>> DocumentIds =
+            new Dictionary<IntPtr, Tuple<IModelDoc2, string>>();
+
+        private static IntPtr DocumentKey(IModelDoc2 doc)
+        {
+            IntPtr key = Marshal.GetIUnknownForObject(doc);
+            Marshal.Release(key);
+            return key;
+        }
+
+        private static string StableDocumentId(IModelDoc2 doc)
+        {
+            IntPtr key = DocumentKey(doc);
+            Tuple<IModelDoc2, string> entry;
+            if (!DocumentIds.TryGetValue(key, out entry))
+            {
+                entry = Tuple.Create(doc, Guid.NewGuid().ToString("N"));
+                DocumentIds[key] = entry;
+            }
+            return entry.Item2;
+        }
+
+        // A Python-side identity probe and the following tool request are separate STA
+        // operations. A document can switch without a state-version change between them.
+        // Bind file writes to the captured COM document inside the same serialized call.
+        private ExecutionResponse CheckFileWriteDocument(
+            ToolRequest request, JObject parameters, IModelDoc2 document, string operation)
+        {
+            string expectedId = parameters?.Value<string>("expected_document_id") ?? string.Empty;
+            string expectedTitle = parameters?.Value<string>("expected_title") ?? string.Empty;
+            string expectedPath = parameters?.Value<string>("expected_path") ?? string.Empty;
+            string expectedType = parameters?.Value<string>("expected_type") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(expectedId))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "EXPECTED_DOCUMENT_REQUIRED",
+                    $"{operation} requires the expected stable source document ID; refresh the document inventory before writing.");
+
+            string actualId = StableDocumentId(document);
+            string actualTitle = document.GetTitle() ?? string.Empty;
+            string actualPath = document.GetPathName() ?? string.Empty;
+            string actualType = DocumentTypeName(document);
+            bool mismatch =
+                (!string.IsNullOrEmpty(expectedId) && expectedId != actualId) ||
+                (!string.IsNullOrEmpty(expectedTitle) &&
+                 !string.Equals(expectedTitle, actualTitle, StringComparison.OrdinalIgnoreCase)) ||
+                (parameters?["expected_path"] != null &&
+                 !string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrEmpty(expectedType) &&
+                 !string.Equals(expectedType, actualType, StringComparison.OrdinalIgnoreCase));
+            return mismatch
+                ? BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "ACTIVE_DOCUMENT_CHANGED",
+                    $"Refusing to {operation} '{(string.IsNullOrEmpty(actualPath) ? actualTitle : actualPath)}' because its source document identity no longer matches the approved document.")
+                : null;
+        }
+
+        // Pure inventory: attach to an existing instance only, without visibility writes,
+        // activation, selection, rebuild or feature-tree traversal. Called on StaExecutor.
+        public Dictionary<string, object> GetOpenDocumentsInfo()
+        {
+            if (_solidWorks == null || !IsAlive(_solidWorks))
+            {
+                try
+                {
+                    _solidWorks = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
+                }
+                catch (PlatformNotSupportedException ex)
+                {
+                    ExecLog.Write($"documents: COM attach platform error (arch={(System.Environment.Is64BitProcess ? "x64" : "x86")}): {ex.Message}");
+                    throw new InvalidOperationException("COM attach is not supported in this runtime/architecture: " + ex.Message, ex);
+                }
+            }
+            var documents = new List<Dictionary<string, object>>();
+            var live = new HashSet<IntPtr>();
+            var all = _solidWorks.GetDocuments() as object[] ?? new object[0];
+            var active = _solidWorks.IActiveDoc2 as IModelDoc2;
+            Dictionary<string, object> activeInfo = null;
+            foreach (object item in all)
+            {
+                var doc = item as IModelDoc2;
+                if (doc == null) throw new InvalidOperationException("Incomplete open-document inventory.");
+                IntPtr key = DocumentKey(doc);
+                live.Add(key);
+                var info = new Dictionary<string, object>
+                {
+                    ["document_id"] = StableDocumentId(doc),
+                    ["title"] = doc.GetTitle(),
+                    ["path"] = doc.GetPathName() ?? string.Empty,
+                    ["type"] = DocumentTypeName(doc),
+                    ["isDirty"] = doc.GetSaveFlag(),
+                    ["updateStamp"] = doc.GetUpdateStamp()
+                };
+                documents.Add(info);
+                if (active != null && DocumentKey(active) == key) activeInfo = info;
+            }
+            if (active != null && activeInfo == null)
+                throw new InvalidOperationException("Active document is missing from inventory.");
+            foreach (IntPtr key in DocumentIds.Keys.Where(k => !live.Contains(k)).ToList())
+                DocumentIds.Remove(key);
+            // A scope whose document is closed can never be committed or rolled back, and the next
+            // begin releases it (BeginUndoScope), so it does not block anything and is not reported.
+            bool scopeOwnerOpen = _undoScopeActive &&
+                documents.Any(d => (string)d["document_id"] == _undoScopeDocumentId);
+            return new Dictionary<string, object>
+            {
+                ["stateVersion"] = _guard.GetCurrentStateVersion(),
+                ["file_write_identity_guard"] = true,
+                ["documents"] = documents,
+                ["active_document"] = activeInfo,
+                ["undo_scope_active"] = scopeOwnerOpen,
+                ["undo_scope_document"] = scopeOwnerOpen ? _undoScopeDocumentTitle : null
+            };
+        }
 
         public bool IsConnected { get; private set; }
 
@@ -33,16 +158,55 @@ namespace SolidworksExecution.Services
         {
             try
             {
-                _solidWorks = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
+                if (_solidWorks == null || !IsAlive(_solidWorks))
+                {
+                    _solidWorks = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
+                    _sessionVisibilityApplied = false;
+                    // A previous server that died mid-request may have left it set, which freezes
+                    // the user's window (see WithCommandInProgress).
+                    try { _solidWorks.CommandInProgress = false; } catch { }
+                }
                 IsConnected = true;
                 EnsureVisible(); // the user must ALWAYS see what the automation does
+                // EnsureVisible writes once per attach; EnsureReady (every job's first call) reaches
+                // here on a live cached attach, so check the live window too (forced-hide test,
+                // 2026-11-08: ensure_ready left a hidden SolidWorks hidden).
+                EnsureVisiblePerRequest();
                 return true;
             }
             catch (COMException)
             {
+                // Dead or absent — drop the cached reference so a later call re-attaches fresh.
+                _solidWorks = null;
+                _sessionVisibilityApplied = false;
                 IsConnected = false;
                 return false;
             }
+            catch (PlatformNotSupportedException ex)
+            {
+                ExecLog.Write($"connect: platform not supported (arch={(System.Environment.Is64BitProcess ? "x64" : "x86")}): {ex.Message}");
+                _solidWorks = null;
+                _sessionVisibilityApplied = false;
+                IsConnected = false;
+                return false;
+            }
+            catch (InvalidCastException ex)
+            {
+                ExecLog.Write($"connect: COM interface cast failed (arch={(System.Environment.Is64BitProcess ? "x64" : "x86")}): {ex.Message}");
+                _solidWorks = null;
+                _sessionVisibilityApplied = false;
+                IsConnected = false;
+                return false;
+            }
+        }
+
+        // One cheap round trip proves the cached RCW still points at a live server. A SolidWorks that
+        // closed underneath us leaves a dead object whose every member call throws COMException, so
+        // without this the cached attach could never recover.
+        private static bool IsAlive(ISldWorks app)
+        {
+            try { app.RevisionNumber(); return true; }
+            catch (COMException) { return false; }
         }
 
         // Force the attached SolidWorks instance to be on-screen and user-controllable.
@@ -51,21 +215,97 @@ namespace SolidworksExecution.Services
         // that one, the user would watch a different window and see nothing happen (observed live: two
         // SLDWORKS processes, the older one window-less). Policy (for now): every instance we touch is
         // made visible. Best-effort — a visibility failure must never break the attach or a tool call.
+        // Runs once per attach: if it fails we leave the flag unset and the next attach retries it.
+        // Tool calls do not depend on it succeeding (see EnsureVisiblePerRequest).
         private void EnsureVisible()
         {
+            if (_sessionVisibilityApplied) return;
             try
             {
                 if (_solidWorks == null) return;
                 if (!_solidWorks.Visible) _solidWorks.Visible = true;
                 _solidWorks.UserControl = true;
+                _sessionVisibilityApplied = true;
             }
-            catch { /* visibility is best-effort; never fail over it */ }
+            catch (Exception ex)
+            {
+                // Best-effort; never fail over it. Logged because a still-starting instance rejects it.
+                ExecLog.Write($"visibility: attach-time write failed {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+            }
+        }
+
+        // The per-request half of the visibility policy, run on every tool call's cached attach.
+        // EnsureConnected skips Connect while the cached RCW is alive, so EnsureVisible alone is
+        // not enough: a cold-launched instance rejects the attach-time write while it is still
+        // starting (2026-11-06: Visible and UserControl both still false after ensure_ready), and
+        // with no re-attach nothing retried it. The whole job then ran in a window-less SolidWorks.
+        // Before 1721d30 every request re-attached and re-ran EnsureVisible; this keeps that
+        // behaviour without the ROT lookup. Costs one property read while the window is shown and
+        // writes only when it is hidden. It only un-hides the window and never takes focus.
+        private void EnsureVisiblePerRequest()
+        {
+            if (_solidWorks == null) return;
+            try
+            {
+                if (_solidWorks.Visible) return;
+                _solidWorks.Visible = true;
+                _solidWorks.UserControl = true;
+                ExecLog.Write("visibility: SolidWorks was hidden, set Visible=true");
+            }
+            catch (Exception ex)
+            {
+                // Best-effort; never fail a tool call over it. The next request tries again.
+                ExecLog.Write($"visibility: re-show failed {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+            }
         }
 
         private bool EnsureConnected()
         {
-            if (_solidWorks != null) return true;
+            if (_solidWorks != null && IsAlive(_solidWorks))
+            {
+                EnsureVisiblePerRequest();
+                return true;
+            }
             return Connect();
+        }
+
+        // Runs one tool request with ISldWorks.CommandInProgress set, which tells SolidWorks an
+        // out-of-process caller is mid-command so it stops servicing its UI between our COM calls.
+        // Measured 2026-11-08 on a 73-face part, same face reads as ReadFaces: 1436 ms/face as is,
+        // 14.7 ms/face with it set; hiding the window or turning graphics updates off changed
+        // nothing. Without it, reads grew past the adapter's 120 s limit and whole parts were
+        // discarded (findings H3/H4/H5). Always cleared again on the SAME instance in `finally`:
+        // left set, the SolidWorks window would stop responding to the user.
+        public T WithCommandInProgress<T>(Func<T> work)
+        {
+            ISldWorks app = null;
+            if (EnsureConnected())
+            {
+                try
+                {
+                    _solidWorks.CommandInProgress = true;
+                    app = _solidWorks;
+                }
+                catch (Exception ex)
+                {
+                    ExecLog.Write($"command-in-progress: set failed {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+                }
+            }
+            try
+            {
+                return work();
+            }
+            finally
+            {
+                if (app != null)
+                {
+                    try { app.CommandInProgress = false; }
+                    catch (Exception ex)
+                    {
+                        ExecLog.Write($"command-in-progress: clear failed {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+                    }
+                }
+            }
         }
 
         private static string DocumentTypeName(IModelDoc2 modelDoc)
@@ -117,26 +357,77 @@ namespace SolidworksExecution.Services
 
         private static bool UndoScopeMatches(IModelDoc2 modelDoc)
         {
-            if (modelDoc == null || !_undoScopeActive) return false;
-            string title = modelDoc.GetTitle() ?? "";
-            string path = modelDoc.GetPathName() ?? "";
-            if (!string.IsNullOrEmpty(_undoScopeDocumentPath) &&
-                !string.IsNullOrEmpty(path))
-                return string.Equals(
-                    _undoScopeDocumentPath,
-                    path,
-                    StringComparison.OrdinalIgnoreCase);
-            return string.Equals(
-                _undoScopeDocumentTitle ?? "",
-                title,
-                StringComparison.OrdinalIgnoreCase);
+            return modelDoc != null && _undoScopeActive &&
+                StableDocumentId(modelDoc) == _undoScopeDocumentId;
         }
 
         private static void ClearUndoScope()
         {
             _undoScopeActive = false;
             _undoScopeDocumentTitle = null;
-            _undoScopeDocumentPath = null;
+            _undoScopeDocumentId = null;
+        }
+
+        // The open document that owns the undo scope, or null once it has been closed. Before
+        // 2026-11-06 a scope whose part was closed by hand (after an interrupted build) could never
+        // be released, and every later build failed with UNDO_SCOPE_ACTIVE until a restart.
+        private static IModelDoc2 FindUndoScopeOwner()
+        {
+            foreach (object item in _solidWorks.GetDocuments() as object[] ?? new object[0])
+            {
+                var doc = item as IModelDoc2;
+                if (doc != null && StableDocumentId(doc) == _undoScopeDocumentId)
+                    return doc;
+            }
+            return null;
+        }
+
+        // Brings the owner back to the front so commit/rollback act on it: the user may have
+        // clicked another window while a build ran. Null when it does not become active.
+        private static IModelDoc2 ActivateUndoScopeOwner(IModelDoc2 owner)
+        {
+            foreach (string name in new[] { owner.GetTitle(), owner.GetPathName() })
+            {
+                if (string.IsNullOrEmpty(name)) continue;
+                int errors = 0;
+                _solidWorks.ActivateDoc3(name, false, 1 /* swDontRebuildActiveDoc */, ref errors);
+                var active = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (UndoScopeMatches(active)) return active;
+            }
+            return null;
+        }
+
+        // Commit and rollback act on the owner wherever it is. Null when that is possible, with
+        // modelDoc then the owner; otherwise the failure, and a scope whose owner is closed is
+        // released. Call under UndoScopeSync.
+        private ExecutionResponse ResolveUndoScopeOwner(
+            ToolRequest request, ref IModelDoc2 modelDoc, out bool reactivated)
+        {
+            reactivated = false;
+            if (!_undoScopeActive)
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "NO_UNDO_SCOPE", "No active undo scope exists.");
+            if (UndoScopeMatches(modelDoc)) return null;
+
+            string title = _undoScopeDocumentTitle;
+            var owner = FindUndoScopeOwner();
+            if (owner == null)
+            {
+                ClearUndoScope();
+                ExecLog.Write($"undo scope released: its document '{title}' was closed");
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNDO_SCOPE_OWNER_CLOSED",
+                    $"The document that owned the undo scope ('{title}') was closed, so nothing is " +
+                    "left to commit or roll back. The scope has been released.");
+            }
+            modelDoc = ActivateUndoScopeOwner(owner);
+            if (modelDoc == null)
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNDO_SCOPE_OWNER_ACTIVATION_FAILED",
+                    $"The undo scope belongs to '{title}', which is open but could not be activated.");
+            reactivated = true;
+            ExecLog.Write($"undo scope owner '{title}' reactivated");
+            return null;
         }
 
         public ExecutionResponse BeginUndoScope(ToolRequest request)
@@ -157,31 +448,44 @@ namespace SolidworksExecution.Services
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
 
+                bool previousDropped = false;
                 lock (UndoScopeSync)
                 {
                     if (_undoScopeActive)
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "UNDO_SCOPE_ACTIVE",
-                            "An undo scope is already active. Commit or roll it back before starting another.");
+                    {
+                        // Still open: a real conflict. Closed (typically by hand after an
+                        // interrupted build): nothing can ever commit or roll it back, so drop it.
+                        if (FindUndoScopeOwner() != null)
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "UNDO_SCOPE_ACTIVE",
+                                $"An undo scope is already open on '{_undoScopeDocumentTitle}' (often a " +
+                                "build that was interrupted). Commit or roll it back, or close that " +
+                                "document without saving, before starting another.");
+                        ExecLog.Write($"undo scope dropped: its document '{_undoScopeDocumentTitle}' was closed");
+                        ClearUndoScope();
+                        previousDropped = true;
+                    }
 
                     modelDoc.Extension.StartRecordingUndoObject();
                     _undoScopeDocumentTitle = modelDoc.GetTitle();
-                    _undoScopeDocumentPath = modelDoc.GetPathName();
+                    _undoScopeDocumentId = StableDocumentId(modelDoc);
                     _undoScopeActive = true;
                 }
 
                 var p = request.Params as JObject;
                 string name = p?.Value<string>("name") ?? "DSH SolidWorks operation";
+                var geometry = new JObject
+                {
+                    ["scope_active"] = true,
+                    ["document"] = modelDoc.GetTitle()
+                };
+                if (previousDropped) geometry["undo_scope_previous_dropped"] = true;
                 return BuildCompleted(
                     request,
                     modelDoc,
                     true,
                     new List<string> { "undo_scope=" + name },
-                    resultGeometry: new JObject
-                    {
-                        ["scope_active"] = true,
-                        ["document"] = modelDoc.GetTitle()
-                    });
+                    resultGeometry: geometry);
             }
             catch (COMException ex)
             {
@@ -208,37 +512,33 @@ namespace SolidworksExecution.Services
 
             try
             {
+                // No NO_ACTIVE_DOCUMENT check: with nothing active the owner may still be open
+                // behind, or closed, and ResolveUndoScopeOwner handles both.
                 var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
-                if (modelDoc == null)
-                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
-
                 var p = request.Params as JObject;
                 string name = p?.Value<string>("name") ?? "DSH SolidWorks operation";
+                bool reactivated;
                 lock (UndoScopeSync)
                 {
-                    if (!_undoScopeActive)
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "NO_UNDO_SCOPE", "No active undo scope exists.");
-                    if (!UndoScopeMatches(modelDoc))
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "UNDO_DOCUMENT_CHANGED",
-                            "The active document is not the document that owns the undo scope.");
+                    var unresolved = ResolveUndoScopeOwner(request, ref modelDoc, out reactivated);
+                    if (unresolved != null) return unresolved;
 
                     modelDoc.Extension.FinishRecordingUndoObject2(name, false);
                     ClearUndoScope();
                 }
 
+                var geometry = new JObject
+                {
+                    ["scope_active"] = false,
+                    ["committed"] = true
+                };
+                if (reactivated) geometry["undo_scope_owner_reactivated"] = true;
                 return BuildCompleted(
                     request,
                     modelDoc,
                     true,
                     new List<string> { "undo_scope_committed=" + name },
-                    resultGeometry: new JObject
-                    {
-                        ["scope_active"] = false,
-                        ["committed"] = true
-                    });
+                    resultGeometry: geometry);
             }
             catch (COMException ex)
             {
@@ -266,20 +566,11 @@ namespace SolidworksExecution.Services
             try
             {
                 var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
-                if (modelDoc == null)
-                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
-
-                bool rebuilt;
+                bool rebuilt, reactivated;
                 lock (UndoScopeSync)
                 {
-                    if (!_undoScopeActive)
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "NO_UNDO_SCOPE", "No active undo scope exists.");
-                    if (!UndoScopeMatches(modelDoc))
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "UNDO_DOCUMENT_CHANGED",
-                            "The active document is not the document that owns the undo scope.");
+                    var unresolved = ResolveUndoScopeOwner(request, ref modelDoc, out reactivated);
+                    if (unresolved != null) return unresolved;
 
                     modelDoc.Extension.FinishRecordingUndoObject2(
                         "DSH SolidWorks rollback", false);
@@ -302,17 +593,19 @@ namespace SolidworksExecution.Services
                     return failed;
                 }
 
+                var geometry = new JObject
+                {
+                    ["scope_active"] = false,
+                    ["rolled_back"] = true,
+                    ["rebuilt"] = true
+                };
+                if (reactivated) geometry["undo_scope_owner_reactivated"] = true;
                 return BuildCompleted(
                     request,
                     modelDoc,
                     true,
                     new List<string> { "undo_scope_rolled_back" },
-                    resultGeometry: new JObject
-                    {
-                        ["scope_active"] = false,
-                        ["rolled_back"] = true,
-                        ["rebuilt"] = true
-                    });
+                    resultGeometry: geometry);
             }
             catch (COMException ex)
             {
@@ -395,6 +688,38 @@ namespace SolidworksExecution.Services
                 result["solidworksWindowless"] = procs.Count(p => p.MainWindowHandle == IntPtr.Zero);
             }
             catch { /* diagnostic only — never fail /health over it */ }
+            return result;
+        }
+
+        // Cheap identity probe (GET /api/tool/identity). Returns the SAME document-identity fields
+        // VerifyState reports, read the SAME way and under the SAME key names (stateVersion,
+        // activeDocument, activeDocumentPath, documentType, isDirty) — and NOTHING else: no feature
+        // tree, no sketches, no dimensions. That omission is the whole point: VerifyState's cost is
+        // dominated by FeatureManager.GetFeatures(true) plus one Name read per feature (thousands of
+        // COM round trips on a production part), while this is four. Callers that only need to know
+        // WHICH document is open (and whether it is dirty) get it in a fraction of the time.
+        // Uses the CACHED attach (EnsureConnected) like every tool call, not Connect()'s fresh ROT
+        // bind. Read-only: no state_version check, no increment, no idempotency registration — the
+        // same discipline as verify_state. Must run on the STA thread (it touches COM).
+        public Dictionary<string, object> GetIdentityInfo()
+        {
+            var result = new Dictionary<string, object>();
+            result["stateVersion"] = _guard.GetCurrentStateVersion();
+            if (!EnsureConnected())
+            {
+                result["error"] = "COM_ATTACH_FAILED: SolidWorks process not found or COM not registered.";
+                return result;
+            }
+            var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+            if (modelDoc == null)
+            {
+                result["error"] = "NO_ACTIVE_DOCUMENT: No active document found in SolidWorks.";
+                return result;
+            }
+            result["activeDocument"] = modelDoc.GetTitle();
+            result["activeDocumentPath"] = modelDoc.GetPathName();
+            result["documentType"] = DocumentTypeName(modelDoc);
+            result["isDirty"] = modelDoc.GetSaveFlag();
             return result;
         }
 
@@ -553,6 +878,7 @@ namespace SolidworksExecution.Services
                         Features = new List<string>(),
                         Dimensions = new List<string>()
                     },
+                    ResultGeometry = new { created_document_id = StableDocumentId(modelDoc) },
                     Error = null
                 };
 
@@ -828,6 +1154,7 @@ namespace SolidworksExecution.Services
                 var p = request.Params as JObject;
                 bool save = p != null && (p.Value<bool?>("save") ?? false);
                 bool closeAll = p != null && (p.Value<bool?>("close_all") ?? false);
+                string closingId = null;
 
                 if (closeAll)
                 {
@@ -851,7 +1178,10 @@ namespace SolidworksExecution.Services
                     string activeTitle = modelDoc.GetTitle() ?? string.Empty;
                     string activePath = modelDoc.GetPathName() ?? string.Empty;
                     string activeType = DocumentTypeName(modelDoc);
+                    closingId = StableDocumentId(modelDoc);
+                    string expectedId = p?.Value<string>("expected_document_id") ?? string.Empty;
                     bool identityMismatch =
+                        (!string.IsNullOrEmpty(expectedId) && expectedId != closingId) ||
                         (!string.IsNullOrEmpty(expectedPath) &&
                          !string.Equals(expectedPath, activePath, StringComparison.OrdinalIgnoreCase)) ||
                         (string.IsNullOrEmpty(expectedPath) &&
@@ -887,11 +1217,18 @@ namespace SolidworksExecution.Services
                     _solidWorks.CloseDoc(docTitle);
                 }
 
+                var inventory = GetOpenDocumentsInfo();
+                var remaining = (List<Dictionary<string, object>>)inventory["documents"];
+                if (closeAll ? remaining.Count != 0 : remaining.Any(d => (string)d["document_id"] == closingId))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "CLOSE_NOT_CONFIRMED", "The requested document is still in the open-document inventory.");
+
                 var response = new ExecutionResponse
                 {
                     OperationId = request.OperationId,
                     Status = "COMPLETED",
                     Verified = true,
+                    ResultGeometry = new { closed_document_id = closingId, close_confirmed = true },
                     StateVersion = _guard.GetCurrentStateVersion() + 1,
                     CadState = new CadState
                     {
@@ -943,6 +1280,9 @@ namespace SolidworksExecution.Services
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
 
+                var identityError = CheckFileWriteDocument(request, p, modelDoc, "save");
+                if (identityError != null) return identityError;
+
                 int saveErrors = 0, saveWarnings = 0;
                 bool success;
 
@@ -980,6 +1320,7 @@ namespace SolidworksExecution.Services
                     Status = "COMPLETED",
                     Verified = true,
                     StateVersion = _guard.GetCurrentStateVersion(),
+                    ResultGeometry = new { source_document_id = StableDocumentId(modelDoc) },
                     CadState = new CadState
                     {
                         StateVersion = _guard.GetCurrentStateVersion(),
@@ -1037,6 +1378,9 @@ namespace SolidworksExecution.Services
                 if (modelDoc == null)
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                var identityError = CheckFileWriteDocument(request, p, modelDoc, "export");
+                if (identityError != null) return identityError;
 
                 bool isDrawing = modelDoc is IDrawingDoc;
 
@@ -1152,6 +1496,9 @@ namespace SolidworksExecution.Services
                 if (modelDoc == null)
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                var identityError = CheckFileWriteDocument(request, p, modelDoc, "batch export");
+                if (identityError != null) return identityError;
 
                 bool isDrawing = modelDoc is IDrawingDoc;
 

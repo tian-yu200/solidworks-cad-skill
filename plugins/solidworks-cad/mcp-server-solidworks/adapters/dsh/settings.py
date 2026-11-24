@@ -11,11 +11,32 @@ STATE_ROOT = Path(os.getenv("DSH_SOLIDWORKS_STATE_ROOT", WORKSPACE_ROOT / "state
 JOB_ROOT = STATE_ROOT / "jobs"
 BACKUP_ROOT = Path(os.getenv("DSH_SOLIDWORKS_BACKUP_ROOT", WORKSPACE_ROOT / "backups"))
 
+# read_drawing_region output: one folder per source drawing (gitignored, under artifacts/).
+INTAKE_ROOT = Path(os.getenv("DSH_SOLIDWORKS_INTAKE_ROOT", WORKSPACE_ROOT / "artifacts" / "intake"))
+# inspect_state(scope="views") output: PNGs of the built part per job (gitignored, under artifacts/).
+VIEWS_ROOT = Path(os.getenv("DSH_SOLIDWORKS_VIEWS_ROOT", WORKSPACE_ROOT / "artifacts" / "views"))
+
+# The solidworks-cad skill's own reference files, served as read-only MCP resources. This is the
+# repository path: the installed preset keeps its `skills` child as a junction to exactly this
+# directory, so one copy answers both. Override for a checkout elsewhere.
+SKILL_REFERENCES_DIR = Path(os.getenv(
+    "DSH_SOLIDWORKS_SKILL_REFERENCES",
+    WORKSPACE_ROOT
+    / "dsh-integration" / "presets" / "solidworks-cad" / "skills"
+    / "solidworks-cad" / "references",
+))
+
 RECIPE_PATH = SOLIDPILOT_ROOT / "cad-planner" / "recipe-usage.md"
 FEATURE_GRAPH_SCHEMA_PATH = (
     SOLIDPILOT_ROOT / "cad-planner" / "contracts" / "feature-graph.schema.json"
 )
 
 ACTION_TTL_SECONDS = int(os.getenv("DSH_SOLIDWORKS_ACTION_TTL_SECONDS", "1800"))
+
+# Cheap identity probe (GET /api/tool/identity, served by ToolController.Identity). Read-only,
+# no state_version check — the same budget family as /health and /state.
+EXECUTION_BASE_URL = os.getenv("EXECUTION_BASE_URL", "http://localhost:5000")
+IDENTITY_ENDPOINT = f"{EXECUTION_BASE_URL}/api/tool/identity"
+IDENTITY_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT", "30"))
 BATCH_NODE_THRESHOLD = int(os.getenv("DSH_SOLIDWORKS_BATCH_NODE_THRESHOLD", "10"))
 BATCH_EDIT_THRESHOLD = int(os.getenv("DSH_SOLIDWORKS_BATCH_EDIT_THRESHOLD", "5"))

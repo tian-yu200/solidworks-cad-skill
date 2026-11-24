@@ -15,6 +15,23 @@ function Write-Status([string]$Message) {
     }
 }
 
+function Invoke-LoggedCommand([string]$Exe, [string[]]$Arguments, [string]$LogFile) {
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Exe @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $_.Exception.Message
+            } else {
+                "$_"
+            }
+        } | Out-File -FilePath $LogFile -Append -Encoding UTF8
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
+}
+
 function Resolve-CommandPath([string]$Name) {
     if (-not $Name) { return $null }
     if (Test-Path -LiteralPath $Name -PathType Leaf) {
@@ -180,7 +197,7 @@ $venvPython = Join-Path $venvRoot "Scripts\python.exe"
 $manifestPath = Join-Path $runtimeRoot "runtime.json"
 $logPath = Join-Path $runtimeRoot "install.log"
 $executionSource = Join-Path $serverRoot "execution\solidworks"
-$executionBuildRoot = Join-Path $runtimeRoot "execution-build-v1"
+$executionBuildRoot = Join-Path $runtimeRoot "execution-build-v2"
 $solutionPath = Join-Path $executionBuildRoot "SolidworksExecution.sln"
 $packagesRoot = Join-Path $executionBuildRoot "packages"
 $packagesConfig = Join-Path $executionBuildRoot "SolidworksExecution\packages.config"
@@ -190,21 +207,23 @@ $requirementsPath = Join-Path $serverRoot "requirements.txt"
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dataRoot "state") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dataRoot "backups") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $dataRoot "artifacts\intake") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $dataRoot "artifacts\views") | Out-Null
 
 try {
     if ($Force -or -not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
         $pythonCommand = Resolve-PythonCommand $Python
         Write-Status "Creating the isolated Python runtime..."
-        $venvArgs = if ($Force) { @("-m", "venv", "--clear", $venvRoot) } else { @("-m", "venv", $venvRoot) }
-        & $pythonCommand.Exe @($pythonCommand.Args) @venvArgs 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Python virtual environment creation failed. See $logPath" }
+        $venvArgs = @($pythonCommand.Args) + $(if ($Force) { @("-m", "venv", "--clear", $venvRoot) } else { @("-m", "venv", $venvRoot) })
+        $code = Invoke-LoggedCommand $pythonCommand.Exe $venvArgs $logPath
+        if ($code -ne 0) { throw "Python virtual environment creation failed. See $logPath" }
     }
 
     Write-Status "Installing Python MCP dependencies..."
-    & $venvPython -m pip install --disable-pip-version-check --upgrade pip 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed. See $logPath" }
-    & $venvPython -m pip install --disable-pip-version-check -r $requirementsPath 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed. See $logPath" }
+    $code = Invoke-LoggedCommand $venvPython @("-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip") $logPath
+    if ($code -ne 0) { throw "pip upgrade failed. See $logPath" }
+    $code = Invoke-LoggedCommand $venvPython @("-m", "pip", "install", "--disable-pip-version-check", "-r", $requirementsPath) $logPath
+    if ($code -ne 0) { throw "Python dependency installation failed. See $logPath" }
 
     $solidWorksRoot = Resolve-SolidWorksDirectory $SolidWorksInstallDir
     $msbuild = Resolve-MSBuild
@@ -215,8 +234,8 @@ try {
     Copy-Item -Path (Join-Path $executionSource "*") -Destination $executionBuildRoot -Recurse -Force
 
     Write-Status "Restoring C# dependencies..."
-    & $nuget install $packagesConfig -OutputDirectory $packagesRoot -NonInteractive 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed. See $logPath" }
+    $code = Invoke-LoggedCommand $nuget @("install", $packagesConfig, "-OutputDirectory", $packagesRoot, "-NonInteractive") $logPath
+    if ($code -ne 0) { throw "NuGet restore failed. See $logPath" }
 
     Write-Status "Building the local SolidWorks execution service..."
     $buildArgs = @(
@@ -230,21 +249,21 @@ try {
     )
     if ($msbuild.Kind -eq "dotnet") {
         $referenceRoot = Join-Path $runtimeRoot "reference-assemblies"
-        & $nuget install "Microsoft.NETFramework.ReferenceAssemblies.net48" -Version "1.0.3" -OutputDirectory $referenceRoot -NonInteractive 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw ".NET Framework 4.8 reference assembly installation failed. See $logPath" }
+        $code = Invoke-LoggedCommand $nuget @("install", "Microsoft.NETFramework.ReferenceAssemblies.net48", "-Version", "1.0.3", "-OutputDirectory", $referenceRoot, "-NonInteractive") $logPath
+        if ($code -ne 0) { throw ".NET Framework 4.8 reference assembly installation failed. See $logPath" }
         $targetFrameworkRoot = Join-Path $referenceRoot "Microsoft.NETFramework.ReferenceAssemblies.net48.1.0.3\build"
         $buildArgs += "/p:TargetFrameworkRootPath=$targetFrameworkRoot"
-        & $msbuild.Exe msbuild @buildArgs 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
+        $code = Invoke-LoggedCommand $msbuild.Exe (@("msbuild") + $buildArgs) $logPath
     } else {
-        & $msbuild.Exe @buildArgs 2>&1 | Tee-Object -FilePath $logPath -Append | Out-Null
+        $code = Invoke-LoggedCommand $msbuild.Exe $buildArgs $logPath
     }
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $executionExe -PathType Leaf)) {
+    if ($code -ne 0 -or -not (Test-Path -LiteralPath $executionExe -PathType Leaf)) {
         $hint = if ($msbuild.Kind -eq "legacy") { " Install Visual Studio Build Tools or a current .NET SDK; the system MSBuild compiler is too old for this source." } else { "" }
         throw "SolidWorks execution service build failed.$hint See $logPath"
     }
 
     $manifest = [ordered]@{
-        version = "1.1.0"
+        version = "2.0.0"
         installedAt = (Get-Date).ToUniversalTime().ToString("o")
         pluginRoot = $pluginRoot
         serverRoot = $serverRoot

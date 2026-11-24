@@ -19,7 +19,7 @@ try {
         $runtime = Get-Content -LiteralPath $runtimeManifest -Raw | ConvertFrom-Json
     }
     if (-not $runtime -or
-        $runtime.version -ne "1.1.0" -or
+        $runtime.version -ne "2.0.0" -or
         $runtime.pluginRoot -ne $pluginRoot -or
         -not (Test-Path -LiteralPath $runtime.python -PathType Leaf) -or
         -not (Test-Path -LiteralPath $runtime.executionExe -PathType Leaf)) {
@@ -41,8 +41,19 @@ try {
     if (-not $env:DSH_SOLIDWORKS_BACKUP_ROOT) {
         $env:DSH_SOLIDWORKS_BACKUP_ROOT = Join-Path $dataRoot "backups"
     }
+    if (-not $env:DSH_SOLIDWORKS_INTAKE_ROOT) {
+        $env:DSH_SOLIDWORKS_INTAKE_ROOT = Join-Path $dataRoot "artifacts\intake"
+    }
+    if (-not $env:DSH_SOLIDWORKS_VIEWS_ROOT) {
+        $env:DSH_SOLIDWORKS_VIEWS_ROOT = Join-Path $dataRoot "artifacts\views"
+    }
+    if (-not $env:DSH_SOLIDWORKS_SKILL_REFERENCES) {
+        $env:DSH_SOLIDWORKS_SKILL_REFERENCES = Join-Path $pluginRoot "skills\solidworks-cad\references"
+    }
     New-Item -ItemType Directory -Force -Path $env:DSH_SOLIDWORKS_STATE_ROOT | Out-Null
     New-Item -ItemType Directory -Force -Path $env:DSH_SOLIDWORKS_BACKUP_ROOT | Out-Null
+    New-Item -ItemType Directory -Force -Path $env:DSH_SOLIDWORKS_INTAKE_ROOT | Out-Null
+    New-Item -ItemType Directory -Force -Path $env:DSH_SOLIDWORKS_VIEWS_ROOT | Out-Null
 
     Push-Location (Split-Path -Parent $server)
     try {

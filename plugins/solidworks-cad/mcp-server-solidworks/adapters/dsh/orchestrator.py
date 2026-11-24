@@ -1,12 +1,17 @@
+import ctypes
 import hmac
 import json
+import os
 import shutil
+import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from backend import ExecutionLayerError, backend
+from diagnostic_attribution import build_diagnostic_attribution, extract_planned_by_model
 from job_store import job_store
 from models import (
     cad_state,
@@ -31,8 +36,130 @@ from policy import (
     validate_edits,
     validate_save_or_export_payload,
 )
-from references import read_reference
-from settings import BACKUP_ROOT
+from references import page_reference, read_reference
+from settings import BACKUP_ROOT, VIEWS_ROOT
+from repair_policy import (IdenticalReplayError, admit as admit_repair, repair_evidence,
+                           design_contract, dimensions_equal, graph_fingerprints)
+
+
+# Who brought the job's document into SolidWorks. finish_job may only auto-close a document
+# the JOB itself produced, so the origin has to be recorded when it happens: it is the one
+# fact that cannot be recovered later (SolidWorks offers no "documents open before the job"
+# query, and the layer has no document-enumeration endpoint).
+ORIGIN_CREATED = "created"          # the job created it (fresh_document graph / new drawing)
+ORIGIN_OPENED = "opened"            # begin_job opened it while nothing else was active
+ORIGIN_PRE_EXISTING = "pre_existing"  # it was already SolidWorks' active document on entry
+ORIGIN_UNBOUND = "unbound"          # the job has no document of its own yet
+CLOSEABLE_ORIGINS = (ORIGIN_CREATED, ORIGIN_OPENED)
+
+_ACTIVE_ATTEMPTS_LOCK = threading.Lock()
+_ACTIVE_ATTEMPT_IDS = set()
+
+
+def _pid_is_alive(pid):
+    """True when OS process `pid` is currently alive."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.GetLastError() == 5  # ERROR_ACCESS_DENIED => alive
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _sketch_fillets(node):
+    """Corners a sketch node rounds with `fillet` profile primitives (2026-11-09)."""
+    if node.get("type") != "sketch" or not isinstance(node.get("profile"), list):
+        return 0
+    return sum(1 for p in node["profile"] if isinstance(p, dict) and p.get("kind") == "fillet")
+
+
+# Said on the failures that leave the model free to go on (findings M3, 2026-11-08): with repairs or
+# a cheap resubmit left, models often stopped and reported "no part was built".
+NOTHING_BUILT = ("（什么都没建，也不占修复次数：把上面每一条都改掉，马上重新提交整张图，不要因此结束本轮。）")
+REPAIR_NEXT_STEP = ("新建的零件已丢弃，可以直接修复：按 error.message 写明的原因改特征图，"
+                    "repair_evidence_json 写清 error_code / cause / readback / change，重新提交整张图。"
+                    "自动修复还剩 %d 次，还有次数时不要结束本轮。")
+
+# What each rendered view shows, in the skill's axis contract (Front looks -Z, Top -Y, Left +X).
+VIEW_GUIDE = {
+    "front": "主视图：沿 -Z 看",
+    "top": "俯视图：沿 -Y 从上往下看",
+    "left": "左视图：从零件左侧沿 +X 看；第一角画法（国标）画在主视图右边，第三角画在左边",
+    "right": "右视图：从零件右侧沿 -X 看",
+    "back": "后视图：沿 +Z 看",
+    "bottom": "仰视图：沿 +Y 从下往上看",
+    "isometric": "轴测图：只看整体形状",
+}
+
+# The planner looked at its part's views and called a solid block "drawing-consistent" against a
+# domed bearing housing (zct01 bc30aa2e, 2026-11-09, findings M6). A per-view list of what the
+# drawing shows and what the image shows makes that comparison an explicit act.
+VIEW_REVIEW_HELP = (
+    "finish_job 需要 view_review_json：对照 inspect_state(scope=\"views\")（或建模结果里附的图）和原图，"
+    "逐个视图写一条 {\"view\": \"front\"|\"top\"|\"left\"|\"right\"|\"back\"|\"bottom\", \"drawing\": \"图纸该视图"
+    "里有哪些轮廓/台阶/孔/槽/凸台\", \"model\": \"模型图里对应看到什么\", \"differences\": \"缺的、多的、"
+    "位置不对的（没有写 无）\", \"notes\": \"可选\", \"verdict\": \"PASS\"|\"FAIL\"|\"N/A\"}。至少覆盖主视、俯视和一个侧视；"
+    "图纸没有的视图写 N/A 并在 differences 里说明。differences 只写看得见的结构差异：孔、槽、台阶、凸台、筋、"
+    "轮廓、标了尺寸的圆角，缺了、多了、位置或形状不对；有这种差异就判 FAIL。技术要求里的未注圆角/倒角、螺纹的"
+    "表示方式（装饰螺纹或底孔）、粗糙度、材料、按推荐读法做的假设、图上没标而取的默认值，不是结构差异，写进 "
+    "notes，判 PASS（这些也要在最终回复里交代）。")
+
+
+def check_view_review(raw):
+    """The parsed per-view review, or RuntimeError VIEW_REVIEW_REQUIRED / VIEW_REVIEW_FAILED."""
+    try:
+        review = json.loads(raw) if isinstance(raw, str) and raw.strip() else raw
+    except ValueError:
+        review = None
+    if not isinstance(review, list) or not review:
+        raise RuntimeError("VIEW_REVIEW_REQUIRED: " + VIEW_REVIEW_HELP)
+    problems, failed, covered = [], [], set()
+    for i, item in enumerate(review):
+        if not isinstance(item, dict) or item.get("view") not in VIEW_GUIDE                 or item.get("verdict") not in ("PASS", "FAIL", "N/A"):
+            problems.append("第 %d 条缺 view（%s）或 verdict（PASS/FAIL/N/A）" % (i + 1, "/".join(VIEW_GUIDE)))
+            continue
+        if item["verdict"] == "N/A":
+            if not str(item.get("differences") or "").strip():
+                problems.append("%s 写 N/A 时要在 differences 里说明图纸为什么没有这个视图" % item["view"])
+            continue
+        if len(str(item.get("drawing") or "").strip()) < 6 or len(str(item.get("model") or "").strip()) < 6:
+            problems.append("%s 的 drawing / model 要逐项写出看到的特征，不能只写一两个字" % item["view"])
+            continue
+        covered.add(item["view"])
+        if item["verdict"] == "FAIL":
+            failed.append("%s：%s" % (item["view"], item.get("differences") or "未写差异"))
+    if problems:
+        raise RuntimeError("VIEW_REVIEW_REQUIRED: " + "；".join(problems) + "。" + VIEW_REVIEW_HELP)
+    if failed:
+        raise RuntimeError("VIEW_REVIEW_FAILED: 视图核对不通过——" + "；".join(failed)
+                           + "。这不是收尾，任务还没完：结构差异（缺/多/错位的孔、槽、台阶、凸台、筋、轮廓、标了尺寸的圆角）"
+                           "现在就改特征图，用 fresh_document 整件重新提交（零件建成后的重建不占 2 次自动修复额度），"
+                           "再看新附的对照图、重新 finish_job。不要因为这里不通过就报 built_unverified 结束，那等于把一个"
+                           "已知不对的零件交给用户；简化成方块、直柱代替弯臂这类近似件同样要重建。未注圆角/倒角、螺纹"
+                           "表示、按推荐读法的假设、默认值不是结构差异：移到 notes，该视图判 PASS。")
+    if not ({"front", "top"} <= covered and covered & {"left", "right"}):
+        raise RuntimeError("VIEW_REVIEW_REQUIRED: 至少要核对主视、俯视和一个侧视（图纸确实没有的写 N/A 也不能顶替这三个中的两个以上）。"
+                           + VIEW_REVIEW_HELP)
+    return review
 
 
 class CadOrchestrator:
@@ -73,67 +200,422 @@ class CadOrchestrator:
                 expected_path=expected_identity.get("path") or "",
                 expected_type=expected_identity.get("type") or "",
             )
+            if expected_identity.get("document_id"):
+                params["expected_document_id"] = expected_identity["document_id"]
         return backend.call("close_document", params)
 
-    def _close_created_document(
-        self,
-        job,
-        *,
-        kind,
-        created_identity,
-        previous_identity,
-    ):
-        if created_identity:
-            close_response = self._close_document(created_identity)
-        else:
-            close_response = {
-                "status": "SKIPPED",
-                "error": {
-                    "code": "CREATED_DOCUMENT_IDENTITY_UNAVAILABLE",
-                    "message": (
-                        "The newly created document was left open because its "
-                        "identity could not be verified safely."
-                    ),
-                },
-            }
+    def _active_identity(self):
+        """Cheap identity of whatever is active right now; {} when nothing is / probe failed.
 
-        close_verify = backend.verify_state()
-        state = (
-            cad_state(close_verify)
-            if close_verify.get("status") == "COMPLETED"
-            else {}
-        )
-        verify_error = error_from(close_verify)
-        recovered = (
-            close_response.get("status") == "COMPLETED"
-            and (
-                (
-                    previous_identity
-                    and close_verify.get("status") == "COMPLETED"
-                    and same_document(previous_identity, state)
-                )
-                or (
-                    not previous_identity
-                    and verify_error
-                    and verify_error.get("code") == "NO_ACTIVE_DOCUMENT"
-                )
+        Uses the identity probe (no feature-tree walk). An empty dict means "this probe saw no
+        active document", never an error — the caller only uses it to decide whether a document
+        was already on screen before the job touched it.
+        """
+        try:
+            response = backend.identity()
+        except Exception:  # noqa: BLE001 - best-effort probe, never fatal
+            return {}
+        if response.get("status") != "COMPLETED":
+            return {}
+        return self._identity(cad_state(response))
+
+    def _document_origin(self, target_document, active_before, state=None):
+        """Classify the document begin_job ended up on, from what was active BEFORE it ran.
+
+        Only two answers are claimed as the job's own: nothing was active at all (so this
+        job's open_document brought the file in) and, later, a document the job created. When
+        any document was already active the target may still have been open in the background
+        — there is no way to enumerate open documents from here — so the job does not claim it.
+        """
+        if not target_document:
+            # Nothing was opened: whatever is active now was already on screen (or there is
+            # no document at all), so this is never a document the job produced.
+            settled = state or {}
+            return (
+                ORIGIN_PRE_EXISTING
+                if (settled.get("activeDocument") or settled.get("activeDocumentPath"))
+                else ORIGIN_UNBOUND
             )
+        seen = active_before.get("title") or active_before.get("path")
+        if not seen:
+            return ORIGIN_OPENED
+        target = normalize_path(str(Path(target_document).resolve()))
+        if normalize_path(active_before.get("path") or "") == target:
+            return ORIGIN_PRE_EXISTING  # already open (and active) under that very path
+        return ORIGIN_PRE_EXISTING      # cannot prove it was not open in the background
+
+    def _autoclose_job_document(self, job, state, keep_open):
+        """finish_job's memory hygiene: close the job's own saved, clean document.
+
+        Closes only when ALL of: the job produced the document (created/opened), it is saved
+        to a path, it is not dirty, and the caller did not pass keep_open. Anything else — and
+        ordinary close failure — leaves the document open and says why. Identity drift
+        invalidates the verdict; other cleanup failures preserve the completed CAD verdict.
+        """
+        identity = self._identity(state)
+        expected_id = (job.get("expected_document") or {}).get("document_id")
+        closing_identity = dict(identity)
+        if expected_id and same_document(job["expected_document"], state):
+            closing_identity["document_id"] = expected_id
+        if keep_open:
+            return {"document_left_open": {"reason": "keep_open",
+                                           "document": identity}}
+        origin = job.get("document_origin")
+        if origin not in CLOSEABLE_ORIGINS:
+            return {"document_left_open": {"reason": origin or ORIGIN_PRE_EXISTING,
+                                           "document": identity}}
+        if not identity.get("path"):
+            return {"document_left_open": {"reason": "unsaved",
+                                           "document": identity}}
+        if state.get("isDirty"):
+            return {"document_left_open": {"reason": "dirty",
+                                           "document": identity}}
+
+        try:
+            response = self._close_document(closing_identity, save=False)
+        except Exception as exc:  # noqa: BLE001 - verified work must not be failed by a close
+            return {"document_left_open": {"reason": "close_failed",
+                                           "document": identity},
+                    "close_error": {"code": "CLOSE_FAILED", "message": str(exc)}}
+        if response.get("status") != "COMPLETED":
+            return {"document_left_open": {"reason": "close_failed",
+                                           "document": identity},
+                    "close_error": self._response_error(response)}
+
+        # Confirm from the layer itself that the document is really gone: either nothing is
+        # active now, or whatever is active is a DIFFERENT document than the one we closed.
+        try:
+            after = backend.identity()
+        except Exception:  # noqa: BLE001 - the close reported success; keep the verdict
+            after = {}
+        after_state = (
+            cad_state(after) if after.get("status") == "COMPLETED" else {}
         )
-        recovery_status = "rolled_back" if recovered else "rollback_failed"
-        event = {
-            "at": utc_now(),
-            "kind": kind,
-            "close_new_document": close_response,
-            "verification": close_verify,
-            "recovery_status": recovery_status,
-        }
-        if recovered:
-            job["expected_document"] = previous_identity or {}
-            job["last_state"] = state if previous_identity else {}
+        still_open = (
+            after.get("status") == "COMPLETED"
+            and bool(self._target(after_state))
+            and same_document(identity, after_state)
+        )
+        if still_open:
+            return {"document_left_open": {"reason": "close_not_confirmed",
+                                           "document": identity},
+                    "close_error": {
+                        "code": "CLOSE_NOT_CONFIRMED",
+                        "message": (
+                            "close_document reported success but the document is "
+                            "still the active SolidWorks document."
+                        ),
+                    }}
+        job["closed_document"] = identity
+        job["target_closed"] = True
+        job["expected_document"] = {}
+        job["last_state"] = {}
+        return {"closed_document": identity, "document_left_open": None}
+
+    @staticmethod
+    def _inventory_state(inventory):
+        doc = inventory.get("active_document") or {}
+        return {"activeDocument": doc.get("title"), "activeDocumentPath": doc.get("path"),
+                "documentType": doc.get("type"), "isDirty": doc.get("isDirty"),
+                "documentId": doc.get("document_id"), "stateVersion": inventory.get("stateVersion")}
+
+    @staticmethod
+    def _inventory_changes(before, after):
+        old = {d["document_id"]: d for d in before.get("documents", [])}
+        new = {d["document_id"]: d for d in after.get("documents", [])}
+        return [key for key, doc in old.items() if new.get(key) != doc]
+
+    def _capture_created_identity(self, job, identity, created_document_id=None):
+        # Ownership must come from the creation response, not from a later title/path match:
+        # a same-named document can be closed and replaced between the two observations.
+        try:
+            inventory = backend.documents()
+            active = inventory.get("active_document") or {}
+            doc = next(
+                (row for row in inventory.get("documents", [])
+                 if row.get("document_id") == created_document_id),
+                None,
+            )
+            old_ids = {d["document_id"] for d in job["documents_before_create"]["documents"]}
+            if (not created_document_id or not doc
+                    or created_document_id in old_ids
+                    or active.get("document_id") != created_document_id
+                    or doc.get("type") != identity.get("type")
+                    or not same_document(identity, {
+                        "activeDocument": doc.get("title"),
+                        "activeDocumentPath": doc.get("path") or "",
+                        "documentType": doc.get("type"),
+                    })):
+                raise RuntimeError("CREATED_DOCUMENT_IDENTITY_UNVERIFIED")
+            identity = {**identity, "document_id": created_document_id}
+        except Exception as exc:
+            identity = {k: v for k, v in identity.items() if k != "document_id"}
+            job["created_document_inventory_error"] = str(exc)
+        job["created_document_identity"] = identity
+        job_store.save(job)
+        return identity
+
+    def _close_created_document(self, job, *, kind, created_identity, previous_identity):
+        # A title/path can be reused. Close only the concrete instance recorded after creation.
+        owned = job.get("created_document_identity") or {}
+        created_id = owned.get("document_id")
+        close_response = {"status": "SKIPPED", "error": {
+            "code": "CREATED_DOCUMENT_IDENTITY_UNAVAILABLE", "message": "No verified owned document ID."}}
+        if created_id and same_document(owned, {
+                "activeDocument": created_identity.get("title"),
+                "activeDocumentPath": created_identity.get("path"),
+                "documentType": created_identity.get("type")}):
+            try:
+                # Preserve the pre-existing active-target guard in addition to the stable ID
+                # guard in C#. Do not even request a close after observing a document switch.
+                active = backend.identity()
+                if active.get("status") != "COMPLETED" or not same_document(owned, cad_state(active)):
+                    raise RuntimeError("ACTIVE_DOCUMENT_CHANGED: owned document is not active")
+                close_response = self._close_document(owned)
+            except Exception as exc:
+                close_response = {"status": "FAILED", "error": {"code": "CLOSE_UNCERTAIN", "message": str(exc)}}
+        event = {"at": utc_now(), "kind": kind, "close_new_document": close_response,
+                 "operation_target": owned or created_identity, "undo_restoration_verified": False,
+                 "recovery_method": "discard_created_document"}
+        state = {}
+        try:
+            inventory = backend.documents()
+            state = self._inventory_state(inventory)
+            baseline = job.get("documents_before_create")
+            changes = self._inventory_changes(baseline, inventory) if baseline is not None else ["baseline_unavailable"]
+            absent = bool(created_id) and all(d["document_id"] != created_id for d in inventory["documents"])
+            closed = close_response.get("status") == "COMPLETED" and absent
+            recovered = closed and not changes and not inventory["undo_scope_active"]
+            event.update(verification={"status": "COMPLETED", "cadState": state},
+                         inventory_after=inventory, previous_documents_changed=changes,
+                         created_document_discarded=closed)
+        except Exception as exc:
+            recovered = closed = False
+            event["verification"] = {"status": "FAILED", "error": {"code": "DOCUMENT_INVENTORY_UNAVAILABLE", "message": str(exc)}}
+        recovery_status = "discarded" if recovered else "rollback_failed"
+        event["recovery_status"] = recovery_status
+        if closed:
+            job["expected_document"] = {}
+            job["document_origin"] = ORIGIN_UNBOUND
+            job["document_write_allowed"] = False
+            job.pop("previous_document_write_allowed", None)
         else:
-            job["expected_document"] = created_identity or {}
-            job["last_state"] = state
+            job["expected_document"] = owned or created_identity or {}
+            job["document_origin"] = ORIGIN_CREATED
+            job["document_write_allowed"] = False
+        job["last_state"] = state
         return recovery_status, state, event
+
+    @staticmethod
+    def _plan_features(job, graph):
+        """Remember the most features of each type any graph of this job asked for.
+
+        The maximum over submissions (not the latest graph) on purpose: measured 2026-10-31, a
+        staged recovery dropped the R3 fillet node from its resubmission and the part was finished
+        without it. Counting by type survives node renaming in a repair. Sketches are not features.
+        """
+        counts = {}
+        for node in graph.get("nodes") or []:
+            kind = node.get("type")
+            if isinstance(kind, str) and kind != "sketch":
+                counts[kind] = counts.get(kind, 0) + 1
+            rounded = _sketch_fillets(node)  # a corner rounded in the sketch is a fillet too
+            if rounded:
+                counts["fillet"] = counts.get("fillet", 0) + rounded
+        planned = job.setdefault("planned_feature_types", {})
+        for kind, count in counts.items():
+            planned[kind] = max(planned.get(kind, 0), count)
+            ids = [n.get("id") for n in graph.get("nodes") or [] if n.get("type") == kind]
+            job.setdefault("planned_feature_ids", {})[kind] = ids
+
+    @staticmethod
+    def _record_built_features(job, compiler, graph, *, fresh_document=False):
+        if fresh_document:
+            job["built_feature_types"] = {}
+        built = job.setdefault("built_feature_types", {})
+        type_by_id = {n.get("id"): n.get("type") for n in (graph or {}).get("nodes") or []}
+        node_by_id = {n.get("id"): n for n in (graph or {}).get("nodes") or []}
+        for node in (compiler or {}).get("node_log") or []:
+            kind = node.get("type") or type_by_id.get(node.get("id"))
+            if node.get("status") == "COMPLETED" and isinstance(kind, str) and kind != "sketch"                     and node.get("id") in type_by_id:
+                built[kind] = built.get(kind, 0) + 1
+            if node.get("status") == "COMPLETED" and kind == "sketch":
+                rounded = _sketch_fillets(node_by_id.get(node.get("id")) or {})
+                if rounded:
+                    built["fillet"] = built.get("fillet", 0) + rounded
+
+    @staticmethod
+    def _plan_check(graph, verification):
+        """The build's readback against graph.expect, or None when the graph states none.
+
+        2026-11-02 (脚踏座, d21731e7): the approved plan said 90×80×117 mm, the graph built
+        60×90×103 (a Ø60 seat for Ø38, a straight web for the R100/R30 arm), and the model
+        reported it verified. The envelope is the check: plans state it reliably (a36a476b's plan
+        93×157×90 against a built 94.07×157.57×90). Axes are compared sorted — a plan speaks in
+        length×width×height, not model axes — each within max(1 mm, 2%). Volume estimates are
+        rougher, so a volume miss beyond 2% is a warning, not a failure.
+        """
+        expect = graph.get("expect")
+        if not isinstance(expect, dict):
+            return None
+        readback = {}
+        for check in verification.get("deep_checks") or []:
+            for item in (check.get("cadState") or {}).get("features") or []:
+                if isinstance(item, str) and "=" in item:
+                    key, _, raw = item.partition("=")
+                    readback.setdefault(key.strip(), raw.strip())
+        built = None
+        try:
+            size = json.loads(readback.get("bbox_size") or "null")
+            if isinstance(size, list) and len(size) == 3:
+                built = sorted(round(float(v) * 1000, 3) for v in size)
+        except (TypeError, ValueError):
+            built = None
+        volume = None
+        try:
+            volume = float(readback["volume"].replace(",", ".")) * 1e9 if "volume" in readback else None
+        except ValueError:
+            volume = None
+
+        result = {"expected": expect, "bbox_ok": None, "volume_ok": None, "warnings": []}
+        wanted = expect.get("bbox_mm")
+        if isinstance(wanted, list) and len(wanted) == 3:
+            wanted = sorted(float(v) for v in wanted)
+            result.update(expected_bbox_mm=wanted, built_bbox_mm=built)
+            if built is None:
+                result["warnings"].append({
+                    "code": "PLAN_ENVELOPE_UNCHECKED",
+                    "message": "读回里没有包络（bbox_size），无法和计划核对：用 inspect_state(geometry) "
+                               "自己核对包络，核对前不得说已验证。"})
+            else:
+                misses = [round(b - w, 3) for w, b in zip(wanted, built)]
+                result["bbox_ok"] = all(abs(m) <= max(1.0, 0.02 * w) for m, w in zip(misses, wanted))
+                result["axis_misses_mm"] = misses
+                result["message"] = (
+                    "建出来的包络 %s mm 与批准计划 expect.bbox_mm %s mm %s（三边排序后逐边比较，容差 "
+                    "max(1 mm, 2%%)）。" % ("×".join("%g" % v for v in built), "×".join("%g" % v for v in wanted),
+                                       "一致" if result["bbox_ok"] else "不符"))
+                if not result["bbox_ok"]:
+                    result["message"] += (
+                        "图没有按计划建：对照计划逐个核对每个节点的尺寸、位置和方向，修正后"
+                        "重新提交整张图（repair_evidence_json.error_code=PLAN_MISMATCH；可以改尺寸和特征，"
+                        "expect 不变）。只有确认是计划本身算错了，才问用户改 expect。")
+        wanted_volume = expect.get("volume_mm3")
+        if isinstance(wanted_volume, (int, float)) and not isinstance(wanted_volume, bool) and volume:
+            delta = (volume - wanted_volume) / wanted_volume
+            result.update(expected_volume_mm3=wanted_volume, built_volume_mm3=round(volume, 1),
+                          volume_ok=abs(delta) <= 0.02)
+            if not result["volume_ok"]:
+                result["warnings"].append({
+                    "code": "PLAN_VOLUME_MISMATCH",
+                    "message": "体积 %.0f mm³ 与 expect.volume_mm3 %g 相差 %+.1f%%（容差 2%%）。先查原因："
+                               "漏建或多建的特征、凸/凹弧方向、深度和贯通；查明前不得说已验证。"
+                               % (volume, wanted_volume, delta * 100)})
+        if result["bbox_ok"] is False:
+            # Reached only for an edit into an existing document (a new one is discarded instead).
+            result["warnings"].append({"code": "PLAN_MISMATCH", "message": result["message"]})
+        return result
+
+    @staticmethod
+    def _dimension_ledger_warnings(graph, verification):
+        """Measure an optional ledger from the completed model; findings are warnings only."""
+        if graph.get("dimension_ledger") is None:
+            return []
+        from dimension_ledger import evaluate_graph_ledger, validate_graph_ledger
+
+        # The ledger is optional diagnostics. A malformed one must not block a build: an extra
+        # or missing field rejecting the whole graph is the expect.features trap again (H1).
+        problems = validate_graph_ledger(graph)
+        if problems:
+            return [{"code": "LEDGER_INVALID",
+                     "message": "；".join(problems[:4]) + "。零件照常建好，这张尺寸表没有核对；"
+                                "按 quickref 的格式改好后，下次提交时会核对。"}]
+
+        ledger = graph.get("dimension_ledger") or []
+        needs_faces = any(
+            item.get("source_kind") != "unknown"
+            and isinstance(item.get("check"), dict)
+            and item["check"].get("kind") in {"cylinder", "plane_distance"}
+            for item in ledger
+        )
+        needs_edges = any(
+            item.get("source_kind") != "unknown"
+            and isinstance(item.get("check"), dict)
+            and item["check"].get("kind") == "plane_distance"
+            for item in ledger
+        )
+        faces_response = None
+        edges_response = None
+        if needs_faces:
+            try:
+                faces_response = backend.call("analyze_model", {"analysis_type": "faces"})
+            except Exception as exc:  # noqa: BLE001 - this cannot undo a valid build
+                faces_response = {"status": "FAILED", "error": {"code": type(exc).__name__}}
+        if needs_edges:
+            try:
+                edges_response = backend.call("analyze_model", {"analysis_type": "edges"})
+            except Exception as exc:  # noqa: BLE001 - this cannot undo a valid build
+                edges_response = {"status": "FAILED", "error": {"code": type(exc).__name__}}
+        expected_state = cad_state((verification or {}).get("state"))
+        expected_version = expected_state.get("stateVersion")
+        observed_versions = [
+            check.get("stateVersion")
+            for check in (verification or {}).get("deep_checks") or []
+            if check.get("status") == "COMPLETED"
+        ]
+        if faces_response is not None and faces_response.get("status") == "COMPLETED":
+            observed_versions.append(faces_response.get("stateVersion"))
+        if edges_response is not None and edges_response.get("status") == "COMPLETED":
+            observed_versions.append(edges_response.get("stateVersion"))
+        if expected_version is not None and any(v != expected_version for v in observed_versions):
+            return [{"code": "LEDGER_UNMEASURED", "reason": "document_state_changed_during_measurement",
+                     "dimension_id": item.get("id"), "label": item.get("label"),
+                     "view": item.get("view"), "node_ids": item.get("node_ids") or [],
+                     "expected": item.get("value"),
+                     "check": (item.get("check") or {}).get("kind")}
+                    for item in ledger if isinstance(item, dict)]
+        try:
+            return evaluate_graph_ledger(graph, verification, faces_response, edges_response)
+        except Exception as exc:  # noqa: BLE001 - diagnostic problems fail closed as a warning
+            return [{"code": "LEDGER_UNMEASURED", "reason": "ledger_check_error",
+                     "message": str(exc)[:240]}]
+
+    @staticmethod
+    def _completeness_warnings(job, state):
+        warnings = list((job.get("plan_check") or {}).get("warnings") or [])
+        warnings.extend(job.get("dimension_ledger_warnings") or [])
+        planned = job.get("planned_feature_types") or {}
+        built = job.get("built_feature_types") or {}
+        missing = {kind: count - built.get(kind, 0) for kind, count in planned.items()
+                   if count > built.get(kind, 0)}
+        if missing:
+            warnings.append({
+                "code": "PLANNED_FEATURES_MISSING",
+                "missing": missing,
+                "planned_ids": {k: (job.get("planned_feature_ids") or {}).get(k) for k in missing},
+                "message": "计划里的特征没有全部建成：%s。补建它们，或在最终回复里如实说明缺少哪些特征及原因。"
+                           % "、".join("%s×%d" % item for item in sorted(missing.items())),
+            })
+        if (job.get("document_origin") == ORIGIN_CREATED and isinstance(state, dict)
+                and state.get("activeDocument") and not state.get("activeDocumentPath")):
+            warnings.append({
+                "code": "CREATED_DOCUMENT_UNSAVED",
+                "message": "新建的零件还没有保存：先用 save_or_export(save) 另存为工作目录下的新文件，再结束。",
+            })
+        return warnings
+
+    @staticmethod
+    def _verification_gaps(job, warnings):
+        """What keeps a passed finish from `verified`. Every completeness warning means something
+        was not objectively confirmed: a volume mismatch, an unchecked envelope or missing planned
+        features used to come out `verified` (review 2026-11-12 F-01). Without a measured
+        dimension ledger only the envelope and volume were compared, so a built feature graph
+        also needs one measured ledger dimension (review 2026-11-13)."""
+        gaps = sorted({w["code"] for w in warnings if isinstance(w, dict) and w.get("code")})
+        built_graph = any(step.get("kind") == "feature_graph" for step in job.get("completed_steps") or [])
+        if built_graph and not job.get("dimension_ledger_measured"):
+            gaps.append("LEDGER_ABSENT")
+        return gaps
 
     @staticmethod
     def _job_metadata(job):
@@ -144,7 +626,244 @@ class CadOrchestrator:
             ),
             "recovery_status": job.get("recovery_status", "not_needed"),
             "trust_level": job.get("trust_level", "unverified"),
+            "automatic_retry_allowed": (job.get("recovery_status") == "discarded"
+                                        and bool(job.get("repair_chain_id"))
+                                        and job.get("repair_attempts_used", 0) < 2),
+            "repair_attempts_used": job.get("repair_attempts_used", 0),
         }
+
+    @staticmethod
+    def _document_block_key(identity):
+        path = normalize_path(identity.get("path") or "")
+        if path:
+            return "path:" + path
+        document_id = identity.get("document_id")
+        return "document:" + document_id if document_id else None
+
+    @staticmethod
+    def _recovery_identity(job, inventory):
+        identity = dict(job.get("expected_document") or {})
+        if not identity or identity.get("document_id"):
+            return identity
+        active = inventory.get("active_document") or {}
+        if active and same_document(identity, CadOrchestrator._inventory_state(inventory)) and active.get("type") == identity.get("type"):
+            identity["document_id"] = active["document_id"]
+            job["expected_document"] = identity
+        return identity
+
+    @staticmethod
+    def _prune_document_blocks(ledger, inventory):
+        docs = inventory.get("documents") or []
+        for key, record in list(ledger.setdefault("blocked_documents", {}).items()):
+            identity = record.get("identity") or {}
+            live = (next((d for d in docs if d["document_id"] == identity["document_id"]), None)
+                    if identity.get("document_id") else
+                    next((d for d in docs if normalize_path(d.get("path") or "") == normalize_path(identity["path"])), None)
+                    if identity.get("path") else None)
+            if not live or CadOrchestrator._document_block_key(identity) != key:
+                ledger["blocked_documents"].pop(key)
+                ledger.setdefault("retired_document_blocks", []).append({**record, "retired_reason": "document_absent_or_legacy_identity"})
+            else:
+                # Save/Save As can change a live instance's path without changing its stable ID.
+                current_key = CadOrchestrator._document_block_key(live)
+                record["identity"] = {k: live.get(k) for k in ("document_id", "path", "title", "type")}
+                if current_key and current_key != key:
+                    ledger["blocked_documents"].pop(key)
+                    ledger["blocked_documents"][current_key] = record
+
+
+    def _reconcile_dead_inflight_chain(self, job, ledger, inventory):
+        """Reconcile a dead orphan `in_flight` attempt when SolidWorks is verified back at baseline.
+
+        Findings H9: killing an MCP/agent process mid-build leaves the last attempt stuck at
+        `in_flight`, causing every subsequent session on any drawing to stop for
+        `REPAIR_RECOVERY_UNVERIFIED` even after the stray part was closed (or never opened).
+        When the owning process is no longer alive AND SolidWorks has no active undo scope and
+        the exact baseline document inventory, the orphan attempt is demonstrably discarded:
+        reconciling it lets `_retire_foreign_chain` archive it for a different part while keeping
+        the 3-attempt repair budget intact for the same part.
+        """
+        chain = ledger.get("active")
+        attempts = (chain or {}).get("attempts") or []
+        if not attempts:
+            return
+        last = attempts[-1]
+        if last.get("recovery_status") != "in_flight":
+            return
+        attempt_id = last.get("attempt_id")
+        with _ACTIVE_ATTEMPTS_LOCK:
+            if attempt_id and attempt_id in _ACTIVE_ATTEMPT_IDS:
+                return
+        pid = last.get("pid")
+        if isinstance(pid, int):
+            if _pid_is_alive(pid):
+                return
+        elif any(a.get("job_id") == job["job_id"] for a in attempts):
+            return
+        if inventory.get("undo_scope_active"):
+            return
+        baseline = chain.get("baseline")
+        if not isinstance(baseline, dict) or not isinstance(baseline.get("documents"), list):
+            return
+        docs = inventory.get("documents")
+        if not isinstance(docs, list):
+            return
+        if (self._inventory_changes(baseline, inventory)
+                or {d["document_id"] for d in baseline["documents"]} !=
+                   {d["document_id"] for d in docs}):
+            return
+        last.update(
+            recovery_status="discarded",
+            status=last.get("status") or "failed",
+            error_code=last.get("error_code") or "EXECUTION_UNCERTAIN",
+            reconciled_from="in_flight",
+            reconciled_at=utc_now(),
+        )
+
+    @staticmethod
+    def _foreign_discarded_chain(job, ledger):
+        """The open chain when another job left it with its last attempt cleanly discarded."""
+        chain = ledger.get("active")
+        attempts = (chain or {}).get("attempts") or []
+        if (attempts and attempts[-1].get("recovery_status") == "discarded"
+                and not any(a.get("job_id") == job["job_id"] for a in attempts)):
+            return chain
+        return None
+
+    def _retire_foreign_chain(self, job, kind, payload, ledger):
+        """Archive a finished failure chain that another job left behind for a different part.
+
+        The chain is cross-job on purpose: a new job must not reset the repair budget of the SAME
+        design. But a cleanly discarded failure on one drawing made the next drawing's first build
+        (another session, another part) wait for a "design changed" confirmation, which models
+        then cancelled (2026-11-01). Nothing of the old chain is left open — its last attempt was
+        discarded — so a different design from a different job starts its own chain.
+        Only a fresh build of a different design retires it. Anything else from that job (an
+        edit, a save) is not held for it (_recovery_reasons) and leaves its budget in place, so
+        a later rebuild of the same design still counts against it.
+        """
+        chain = self._foreign_discarded_chain(job, ledger)
+        if chain is None or kind != "feature_graph" or not payload.get("fresh_document"):
+            return
+        old_drawing = normalize_path(chain.get("drawing_path") or "")
+        new_drawing = normalize_path(job.get("drawing_path") or "")
+        explicitly_different_drawing = bool(old_drawing and new_drawing and old_drawing != new_drawing)
+        if (not explicitly_different_drawing
+                and chain.get("design_contract") is not None
+                and dimensions_equal(chain["design_contract"], design_contract(payload["graph"]))):
+            return
+        chain.update(closed_by="new_job", closed_reason="另一个任务的新零件", closed_at=utc_now())
+        ledger.setdefault("history", []).append(chain)
+        ledger["active"] = None
+
+    def _recovery_reasons(self, job, kind, payload, ledger, inventory):
+        self._prune_document_blocks(ledger, inventory)
+        self._reconcile_dead_inflight_chain(job, ledger, inventory)
+        self._retire_foreign_chain(job, kind, payload, ledger)
+        identity = self._recovery_identity(job, inventory)
+        key = self._document_block_key(identity)
+        reasons = []
+        if key and key in ledger["blocked_documents"]:
+            reasons.append("已有文档上次恢复未验证，继续写入需要用户确认")
+        if job.get("recovery_status") in ("recovery_unverified", "rollback_failed"):
+            # A disappeared stable instance must not poison its reused title or an unbound job.
+            old_id = identity.get("document_id")
+            if not old_id or any(d["document_id"] == old_id for d in inventory["documents"]):
+                reasons.append("上次恢复未验证，%s 可能未关闭或仍有修改" % (identity.get("title") or "失败文档"))
+        chain = ledger.get("active")
+        if kind == "feature_graph" and payload["fresh_document"]:
+            try:
+                admit_repair(chain, payload["graph"], payload.get("repair_evidence") or {})
+            except IdenticalReplayError as exc:
+                reasons.append(str(exc))
+            except RuntimeError as exc:
+                reasons.append(str(exc).partition(": ")[2] or str(exc))
+            if chain:
+                baseline = chain.get("baseline")
+                if not isinstance(baseline, dict) or "documents" not in baseline:
+                    reasons.append("上次文档清单缺失，需确认在当前环境开始新执行")
+                elif (self._inventory_changes(baseline, inventory)
+                      or {d["document_id"] for d in baseline["documents"]} !=
+                         {d["document_id"] for d in inventory["documents"]}):
+                    reasons.append("打开的文档有变化，需确认在当前环境开始新执行")
+        elif chain and self._foreign_discarded_chain(job, ledger) is None:
+            reasons.append("上次新建执行链尚未解决；本次不是完整自动重建，需确认另行执行")
+        if inventory.get("undo_scope_active"):
+            # Reported only while the scope's document is open. Closing that document releases the
+            # scope (the next begin drops it); confirming alone does not, the begin would refuse.
+            reasons.append("上次执行的 Undo scope 仍挂在打开的「%s」上：先在 SolidWorks 里关掉它（不保存）再确认，否则新建模会被拒绝"
+                           % (inventory.get("undo_scope_document") or "上次未完成的文档"))
+        return list(dict.fromkeys(reasons)), key
+
+
+    def _prepare_recovery_action(self, job, kind, payload, risk, summary):
+        payload = dict(payload)
+        payload.pop("recovery_override", None)
+        inventory = backend.documents()
+        with job_store.recovery_chain() as ledger:
+            reasons, key = self._recovery_reasons(job, kind, payload, ledger, inventory)
+            if len(reasons) == 1 and reasons[0].startswith("REPAIR_IDENTICAL_REPLAY:"):
+                raise IdenticalReplayError(reasons[0])
+            if reasons:
+                scope = {"reasons": reasons, "chain_revision": payload_hash(ledger.get("active")),
+                         "inventory_revision": payload_hash(inventory),
+                         "document_block_key": key,
+                         "block_revision": payload_hash(ledger["blocked_documents"].get(key)),
+                         "archive_reason": job.get("recovery_archive_reason") or None}
+                payload["recovery_override"] = scope
+                risk = "batch"  # One existing confirmation also covers a graph over ten nodes.
+                action_summary = summary
+                visible_reasons = [reason.partition(": ")[2] if reason.startswith("REPAIR_IDENTICAL_REPLAY:")
+                                   else reason for reason in reasons]
+                summary = "；".join(visible_reasons) + "。确认后归档旧失败链，解除本目标的恢复阻止；不自动关闭残留文档。"
+                if scope.get("archive_reason"):
+                    summary += "归档原因：" + scope["archive_reason"] + "。"
+                if kind == "feature_graph" and payload["fresh_document"]:
+                    summary += "本次作为新首次执行（修复计数 0），包含 %s 个节点。" % len(payload["graph"].get("nodes", []))
+                summary += "本次操作：" + action_summary
+                summary += "确认范围：" + payload_hash(scope)[:16]
+        job_store.save(job)
+        return payload, risk, summary, inventory
+
+
+    @staticmethod
+    def _override_is_current(ledger, scope):
+        return (payload_hash(ledger.get("active")) == scope["chain_revision"]
+                and payload_hash(ledger.get("blocked_documents", {}).get(scope.get("document_block_key"))) == scope["block_revision"])
+
+    def _archive_user_override(self, job, ledger, scope):
+        chain = ledger.get("active")
+        # Callers check the revision while holding the same cross-process ledger lock.
+        if chain:
+            system_reasons = "；".join(scope["reasons"])
+            archive_reason = scope.get("archive_reason")
+            chain.update(closed_by="user_override",
+                         closed_reason=(archive_reason + "（原因：" + system_reasons + "）"
+                                        if archive_reason else system_reasons),
+                         closed_at=utc_now())
+            ledger.setdefault("history", []).append(chain)
+            ledger["active"] = None
+        key = scope.get("document_block_key")
+        if key:
+            record = ledger.setdefault("blocked_documents", {}).pop(key, None)
+            if record:
+                ledger.setdefault("retired_document_blocks", []).append({**record, "closed_by": "user_override"})
+        job["recovery_status"] = "not_needed"
+        job["repair_attempts_used"] = 0
+        job.pop("repair_chain_id", None)
+        job.setdefault("recovery_overrides", []).append({"at": utc_now(), **scope})
+
+
+    def _authorize_recovery_execution(self, job, kind, payload, risk, summary, confirmed):
+        prepared, risk, summary, inventory = self._prepare_recovery_action(job, kind, payload, risk, summary)
+        scope = prepared.get("recovery_override")
+        if scope and (not confirmed or scope != payload.get("recovery_override")):
+            return prepared, risk, inventory, self._queue_confirmation(job, kind, prepared, risk, summary)
+        return prepared, risk, inventory, None
+
+    def _queue_refreshed_recovery(self, job, kind, payload, risk, summary):
+        prepared, risk, summary, _ = self._prepare_recovery_action(job, kind, payload, risk, summary)
+        return self._queue_confirmation(job, kind, prepared, risk, summary)
 
     def _record_success(self, job, kind, trust_level):
         job["execution_status"] = "completed"
@@ -167,6 +886,13 @@ class CadOrchestrator:
         recovery_status,
         recovery=None,
     ):
+        if kind == "document_edits" or (kind == "feature_graph" and job.get("current_graph_fresh") is False):
+            recovery_status = "recovery_unverified"
+            identity = job.get("expected_document") or {}
+            key = self._document_block_key(identity)
+            if key:
+                with job_store.recovery_chain() as ledger:
+                    ledger.setdefault("blocked_documents", {})[key] = {"identity": identity, "job_id": job["job_id"], "at": utc_now()}
         job["execution_status"] = execution_status
         job["verification_status"] = verification_status_value
         job["recovery_status"] = recovery_status
@@ -201,91 +927,45 @@ class CadOrchestrator:
             return None
         return self._response_error(response)
 
-    def _recover_transaction(
-        self,
-        job,
-        *,
-        kind,
-        previous_identity,
-        newly_created,
-    ):
-        rollback = backend.rollback_transaction()
-        event = {
-            "at": utc_now(),
-            "kind": kind,
-            "rollback": rollback,
-            "newly_created_document": newly_created,
-        }
-        recovery_status = (
-            "rolled_back"
-            if rollback.get("status") == "COMPLETED"
-            else "rollback_failed"
-        )
-
-        rollback_verify = backend.verify_state()
-        event["rollback_verification"] = rollback_verify
-        rollback_state = (
-            cad_state(rollback_verify)
-            if rollback_verify.get("status") == "COMPLETED"
-            else {}
-        )
-        if rollback_verify.get("status") != "COMPLETED":
-            recovery_status = "rollback_failed"
-
+    def _recover_transaction(self, job, *, kind, previous_identity, newly_created):
+        # Undo is best effort only. P5 proved COMPLETED did not restore the geometry baseline.
+        try:
+            rollback = backend.rollback_transaction()
+        except Exception as exc:
+            rollback = {"status": "FAILED", "error": {"code": "UNDO_UNCERTAIN", "message": str(exc)}}
         if newly_created:
-            current_identity = job.get("expected_document") or {}
-            target_still_active = (
-                rollback_verify.get("status") == "COMPLETED"
-                and current_identity
-                and same_document(current_identity, rollback_state)
-            )
-            if not target_still_active:
-                recovery_status = "rollback_failed"
-                event["close_new_document"] = {
-                    "status": "SKIPPED",
-                    "error": {
-                        "code": "ACTIVE_DOCUMENT_CHANGED",
-                        "message": (
-                            "The newly created document was not closed because "
-                            "it is no longer the verified active document."
-                        ),
-                    },
-                }
-                event["verification"] = rollback_verify
-                state = rollback_state
-                job["last_state"] = state
-            else:
-                close_status, state, close_event = (
-                    self._close_created_document(
-                        job,
-                        kind=kind,
-                        created_identity=current_identity,
-                        previous_identity=previous_identity,
-                    )
-                )
-                event["close_new_document"] = close_event[
-                    "close_new_document"
-                ]
-                event["verification"] = close_event["verification"]
-                if (
-                    rollback.get("status") != "COMPLETED"
-                    or close_status != "rolled_back"
-                ):
-                    recovery_status = "rollback_failed"
-        else:
-            verify = rollback_verify
-            event["verification"] = verify
-            state = rollback_state
-            if (
-                verify.get("status") != "COMPLETED"
-                or not same_document(previous_identity, state)
-            ):
-                recovery_status = "rollback_failed"
-            else:
-                job["last_state"] = state
+            recovery_status, state, event = self._close_created_document(
+                job, kind=kind, created_identity=job.get("expected_document") or {},
+                previous_identity=previous_identity)
+            event.update(rollback=rollback, newly_created_document=True)
+            return recovery_status, state, event
+        try:
+            verify = backend.verify_state()
+        except Exception as exc:
+            verify = {"status": "FAILED", "error": {"code": "RECOVERY_UNVERIFIED", "message": str(exc)}}
+        state = cad_state(verify) if verify.get("status") == "COMPLETED" else {}
+        job["last_state"] = state
+        job["automatic_retry_allowed"] = False
+        return "recovery_unverified", state, {
+            "at": utc_now(), "kind": kind, "rollback": rollback, "verification": verify,
+            "recovery_status": "recovery_unverified", "undo_restoration_verified": False,
+            "newly_created_document": False,
+            "reason": "Undo semantic restoration is not verified; automatic retry is prohibited."}
 
-        event["recovery_status"] = recovery_status
-        return recovery_status, state, event
+    def _discard_report(self, recovery_status, recovery_event, created_identity, recovered_state):
+        if not created_identity:
+            return {}, None
+        event = recovery_event or {}
+        discarded = event.get("created_document_discarded") is True
+        label = created_identity.get("path") or created_identity.get("title") or "untitled document"
+        return {
+            "operation_target": created_identity,
+            "created_document_discarded": discarded,
+            "remaining_modified_document": None if discarded else created_identity,
+            "active_document_after_recovery": self._target(recovered_state),
+            "recovery_method": "discard_created_document",
+            "undo_restoration_verified": False,
+        }, label
 
     def _transaction_failure_response(
         self,
@@ -302,17 +982,18 @@ class CadOrchestrator:
         partial_state,
         target_state,
         backup_path=None,
+        created_identity=None,
     ):
         if phase == "verification":
             verification_value = verification_status(verification)
             response_status = (
                 "partial"
-                if recovery_status == "rollback_failed"
+                if recovery_status in ("rollback_failed", "recovery_unverified")
                 else "verification_failed"
             )
             execution_value = (
                 "partial"
-                if recovery_status == "rollback_failed"
+                if recovery_status in ("rollback_failed", "recovery_unverified")
                 else "completed"
             )
         else:
@@ -324,12 +1005,12 @@ class CadOrchestrator:
             )
             response_status = (
                 "failed"
-                if recovery_status == "rolled_back"
+                if recovery_status == "discarded"
                 else "partial"
             )
             execution_value = (
                 "failed"
-                if recovery_status == "rolled_back"
+                if recovery_status == "discarded"
                 else "partial"
             )
 
@@ -343,18 +1024,136 @@ class CadOrchestrator:
             recovery_status=recovery_status,
             recovery=recovery_event,
         )
+        extras, discarded_target = self._discard_report(
+            recovery_status, recovery_event, created_identity, target_state
+        )
+        metadata = self._job_metadata(job)
+        if kind == "feature_graph" and response_status == "failed" and metadata["automatic_retry_allowed"]:
+            # 2026-11-08 bench (findings M3): with repairs left, models often stopped after one
+            # failed build and reported "no part". Say plainly that the next move is a repair.
+            extras["next_step"] = REPAIR_NEXT_STEP % (2 - metadata["repair_attempts_used"])
         return envelope(
             status=response_status,
             risk=risk,
             job_id=job["job_id"],
-            target_document=self._target(target_state),
+            target_document=discarded_target or self._target(target_state),
             backup_path=backup_path,
             completed_steps=completed_steps,
             partial_state=partial_state,
             verification=verification,
             error=error,
-            **self._job_metadata(job),
+            **extras,
+            **metadata,
         )
+
+    def _post_verify_failure_response(
+        self,
+        job,
+        *,
+        kind,
+        risk,
+        error,
+        previous_identity,
+        newly_created,
+        completed_steps,
+        partial_state,
+        backup_path=None,
+        created_identity=None,
+    ):
+        """Recover a transaction whose post-verification RAISED (transport error, timeout).
+
+        Without this the exception escaped with the undo scope still open, the job metadata
+        untouched (verification_status not_run, empty failure_history) and no typed error.
+        Mirrors the try/except that _execute_feature_graph already had around _post_verify.
+        """
+        if isinstance(error, ExecutionLayerError):
+            typed_error = {
+                "code": "EXECUTION_LAYER_ERROR",
+                "message": str(error),
+            }
+        else:
+            typed_error = {
+                "code": "POST_VERIFICATION_ERROR",
+                "message": f"{type(error).__name__}: {error}",
+            }
+
+        recovery_status, recovered_state, recovery = self._recover_transaction(
+            job,
+            kind=kind,
+            previous_identity=previous_identity,
+            newly_created=newly_created,
+        )
+        verification = {
+            "state": recovery.get("verification"),
+            "deep_checks": [],
+            "all_completed": False,
+            "available": (recovery.get("verification") or {}).get("status")
+            == "COMPLETED",
+            "post_verify_error": typed_error,
+        }
+        return self._transaction_failure_response(
+            job,
+            kind=kind,
+            phase="verification",
+            risk=risk,
+            error=typed_error,
+            verification=verification,
+            recovery_status=recovery_status,
+            recovery_event=recovery,
+            completed_steps=completed_steps,
+            partial_state={
+                "cad": recovered_state,
+                **partial_state,
+            },
+            target_state=recovered_state,
+            backup_path=backup_path,
+            created_identity=created_identity,
+        )
+
+    def _uncertain_attempt_response(self, job, payload, risk, progress, exc):
+        """Recover a Feature Graph attempt that RAISED (transport error, timeout) instead of answering.
+
+        Until 2026-11-06 this recorded rollback_failed without trying anything, so the attempt's
+        undo scope stayed open and every later build failed with UNDO_SCOPE_ACTIVE. Only a scope
+        this attempt asked for and has not closed is rolled back: before begin, or after a refused
+        begin, an open scope is another document's, and after commit a rollback would throw away
+        a finished part. Those cases are left as they are and reported recovery_unverified.
+        """
+        fresh = payload["fresh_document"]
+        scope = progress.get("scope")
+        previous_identity = progress.get("previous_identity") or {}
+        created_identity = progress.get("created_identity") if fresh else None
+        recovery_status, state, recovery = "recovery_unverified", job.get("last_state") or {}, None
+        try:
+            if scope == "requested":
+                recovery_status, state, recovery = self._recover_transaction(
+                    job, kind="feature_graph", previous_identity=previous_identity, newly_created=fresh)
+            elif scope is None and created_identity:
+                recovery_status, state, recovery = self._close_created_document(
+                    job, kind="feature_graph", created_identity=created_identity,
+                    previous_identity=previous_identity)
+        except Exception as recovery_exc:  # noqa: BLE001 - the recovery itself must not escape
+            recovery_status, recovery = "rollback_failed", {
+                "error": {"code": "RECOVERY_RAISED", "message": str(recovery_exc)}}
+        if recovery is None:
+            recovery = {"recovery_method": "none"}
+        recovery.setdefault("at", utc_now())
+        recovery.setdefault("kind", "feature_graph")
+        recovery.setdefault("recovery_status", recovery_status)
+        recovery["undo_scope"] = scope or "not_requested"
+        error = {"code": "EXECUTION_UNCERTAIN", "message": str(exc)}
+        discarded = recovery_status == "discarded"
+        self._record_failure(
+            job, kind="feature_graph", phase="uncertain_execution", error=error,
+            execution_status="failed" if discarded else "partial",
+            verification_status_value="unavailable", recovery_status=recovery_status,
+            recovery=recovery)
+        extras, discarded_target = self._discard_report(
+            recovery_status, recovery, created_identity, state)
+        return envelope(
+            status="failed" if discarded else "partial", risk=risk, job_id=job["job_id"],
+            target_document=discarded_target or self._target(state), partial_state=state,
+            error=error, **extras, **self._job_metadata(job))
 
     def status(self):
         try:
@@ -380,11 +1179,21 @@ class CadOrchestrator:
             verification={"health": health, "state_error": state_error},
         )
 
-    def reference(self, topic):
-        value = read_reference(topic)
+    def reference(self, topic, offset=None, limit=None):
+        """One page of `topic` (defaults keep every page under the host's elision budget).
+
+        Large references are read in pieces: the page reports its own size, whether more
+        remains and the next offset, and a JSON reference also carries a section index so
+        the caller can jump straight to the part it needs.
+        """
+        page = page_reference(topic, offset, limit)
         return envelope(
             status="completed",
-            verification={"topic": topic, "content": value},
+            verification={
+                "topic": topic,
+                "content": page["content"],
+                "page": page["page"],
+            },
         )
 
     def inspect_state(
@@ -394,9 +1203,11 @@ class CadOrchestrator:
         scope="state",
         component="",
         reference_topic="contract",
+        reference_offset=None,
+        reference_limit=None,
     ):
         if scope == "reference":
-            return self.reference(reference_topic)
+            return self.reference(reference_topic, reference_offset, reference_limit)
         if bool(job_id) != bool(job_token):
             raise ValueError(
                 "job_id and job_token must be supplied together"
@@ -484,8 +1295,41 @@ class CadOrchestrator:
                 **self._job_metadata(job),
             )
 
-    def begin_job(self, intent, target_document="", as_assembly=False):
+    def render_views(self, job_id, job_token, views="front,top,left,isometric"):
+        """PNG paths of the job's part in standard views, hidden edges grey (findings M5).
+
+        Numbers that agree can hide a missing feature: a 缺口块 build without its ramp still measured
+        42x30x30 and passed. These images are for comparing the build with the drawing view by view.
+        Read-only: the execution layer changes only the view orientation and restores the display."""
+        names = [v.strip().lower() for v in (views or "").split(",") if v.strip()]
+        unknown = [n for n in names if n not in VIEW_GUIDE]
+        if not names or unknown:
+            raise ValueError("views must be a comma list of %s (got %r)" % (", ".join(VIEW_GUIDE), views))
+        if not (job_id and job_token):
+            raise ValueError("A CAD job is required for document analysis")
         with self._write_lock:
+            job = self._load_job(job_id, job_token)
+            state, _state_response = self._verify_job_document(job)
+            if state.get("documentType") not in ("PART", "ASSEMBLY"):
+                raise ValueError("scope 'views' needs a part or assembly document, not %s"
+                                 % (state.get("documentType") or "no document"))
+            out = VIEWS_ROOT / job_id / time.strftime("%Y%m%d-%H%M%S")
+            response = backend.call("render_views", {"output_dir": str(out), "views": names})
+        if response.get("status") != "COMPLETED":
+            error = self._response_error(response)
+            raise RuntimeError("RENDER_FAILED: %s" % (error.get("message") if isinstance(error, dict) else error))
+        features = (response.get("cadState") or {}).get("features") or ["{}"]
+        rendered = json.loads(features[0]).get("views") or []
+        for item in rendered:
+            item["shows"] = VIEW_GUIDE.get(item.get("view"), "")
+        return {"target_document": self._target(state), "drawing_path": job.get("drawing_path"),
+                "views": rendered}
+
+    def begin_job(self, intent, target_document="", as_assembly=False, drawing_path="",
+                  recovery_archive_reason=""):
+        with self._write_lock:
+            if not isinstance(recovery_archive_reason, str) or len(recovery_archive_reason) > 300:
+                raise ValueError("recovery_archive_reason must be a string of at most 300 characters")
             ready = backend.ensure_ready()
             if not ready.get("comAttached"):
                 return envelope(
@@ -500,6 +1344,11 @@ class CadOrchestrator:
                 )
 
             completed = ["ensure_ready"]
+            # Recorded BEFORE the open: the pre-open active identity is the only evidence
+            # available later about whether this file was already on screen (see origin gate).
+            active_before = (
+                self._active_identity() if target_document else {}
+            )
             if target_document:
                 opened = backend.call(
                     "open_document",
@@ -518,7 +1367,13 @@ class CadOrchestrator:
                     )
                 completed.append("open_document")
 
-            verified = backend.verify_state()
+            # SPEED (#2): begin_job consumes nothing but identity — the fields it binds the job
+            # to (activeDocument/activeDocumentPath/documentType) and the state_version it hands
+            # back. GET /api/tool/identity reports exactly those, read the same way as
+            # verify_state does, without the FeatureManager.GetFeatures(true) tree walk
+            # (measured 381.7 ms of a 663.4 ms begin_job). backend.identity() degrades to the
+            # full verify_state if the endpoint is unusable, so the check cannot get weaker.
+            verified = backend.identity()
             state = (
                 cad_state(verified)
                 if verified.get("status") == "COMPLETED"
@@ -533,18 +1388,54 @@ class CadOrchestrator:
                 )
 
             job_id = str(uuid.uuid4())
+            identity = self._identity(state)
+            if identity.get("title") or identity.get("path"):
+                inventory = backend.documents()
+                active = inventory.get("active_document") or {}
+                if not active.get("document_id") or not same_document(identity, self._inventory_state(inventory)):
+                    raise RuntimeError("ACTIVE_DOCUMENT_CHANGED: job source changed while binding its instance.")
+                identity["document_id"] = active["document_id"]
             job, token = job_store.create(
-                job_id, intent, self._identity(state)
+                job_id, intent, identity
             )
             job["last_state"] = state
+            job["document_origin"] = self._document_origin(
+                target_document, active_before, state
+            )
+            if recovery_archive_reason.strip():
+                job["recovery_archive_reason"] = recovery_archive_reason.strip()
+            if drawing_path:
+                try:
+                    job["drawing_path"] = str(Path(drawing_path).expanduser().resolve())
+                except (OSError, RuntimeError):
+                    job["drawing_path"] = str(drawing_path)
+            else:
+                job["drawing_path"] = None
+            job["document_write_allowed"] = bool(target_document)
+            job["explicit_target_document"] = bool(target_document)
             job_store.save(job)
+            # The result must stay SMALL: the host elides a long tool result down to its
+            # head + a marker + its tail, which used to bury `job_token` in the removed
+            # middle so the model never saw it and every later call failed
+            # PERMISSION_DENIED. The bulky readiness/partial_state detail now lives
+            # behind inspect_state (scope=state / scope=geometry); what stays here is the
+            # identity the caller must echo back, the token, and the state version.
             return envelope(
                 status="completed",
                 job_id=job_id,
                 target_document=self._target(state),
                 completed_steps=completed,
-                partial_state=state,
-                verification={"readiness": ready},
+                partial_state={
+                    "stateVersion": state.get("stateVersion"),
+                    "activeDocument": state.get("activeDocument"),
+                    "activeDocumentPath": state.get("activeDocumentPath"),
+                    "documentType": state.get("documentType"),
+                },
+                verification={
+                    "comAttached": ready.get("comAttached"),
+                    "stateVersion": state.get("stateVersion"),
+                    "detail": "inspect_state",
+                },
                 job_token=token,
                 instruction=(
                     "Keep job_token private and pass it to every later call for this CAD job."
@@ -564,8 +1455,89 @@ class CadOrchestrator:
             )
         return job
 
-    def _verify_job_document(self, job, allow_no_document=False):
-        response = backend.verify_state()
+    @staticmethod
+    def _pending_feature_graph(job):
+        # An expired graph can no longer be confirmed, so it must not hold the job's writes either.
+        return next(
+            (
+                action
+                for action in (job.get("pending_actions") or {}).values()
+                if action.get("kind") == "feature_graph"
+                and not action.get("consumed")
+                and not action_expired(action)
+            ),
+            None,
+        )
+
+    def _require_no_pending_feature_graph(self, job, operation):
+        action = self._pending_feature_graph(job)
+        if action:
+            raise RuntimeError(
+                "GRAPH_PENDING_CONFIRMATION: "
+                f"{operation} is refused while Feature Graph action "
+                f"'{action.get('action_id', 'unknown')}' is awaiting confirmation. "
+                "Confirm or cancel that graph first."
+            )
+
+    def _require_document_write_access(self, job, operation):
+        self._require_no_pending_feature_graph(job, operation)
+        if not job.get("document_write_allowed", False):
+            raise RuntimeError(
+                "JOB_DOCUMENT_READ_ONLY: this job began without an explicit target "
+                "document, and the active document was pre-existing. It is bound "
+                "read-only; start a new job with target_document or build a fresh "
+                "document with a confirmed fresh_document Feature Graph."
+            )
+
+    @staticmethod
+    def _job_is_unbound(job):
+        """True when the job was started without a document and has not created one yet."""
+        expected = job.get("expected_document") or {}
+        return not (expected.get("path") or expected.get("title"))
+
+    def _require_bound_job(self, job, operation):
+        """Refuse an operation that would act on "whatever document is active".
+
+        A job started with no active document has no document identity to verify against, so
+        its writes used to land on any document the user happened to have open (see the
+        ACTIVE_DOCUMENT_CHANGED guard in _verify_job_document, which is skipped for an empty
+        expected_document). Binding now happens only through the job's own document-creating
+        operations.
+        """
+        if self._job_is_unbound(job):
+            raise RuntimeError(
+                "JOB_DOCUMENT_UNBOUND: this CAD job is not bound to a document yet, "
+                f"so {operation} is refused. Start a new job with target_document (or "
+                "open the document first and start a new job), then retry."
+            )
+
+    @staticmethod
+    def _action_creates_document(kind, payload):
+        """True for pending actions that create their own document (the only adoption path)."""
+        if kind == "feature_graph":
+            return bool(payload.get("fresh_document", True))
+        if kind == "drawing_workflow":
+            return True
+        # close_all is deliberately document-agnostic.
+        if kind == "save_or_export":
+            return bool(payload.get("operation") == "close" and payload.get("close_all"))
+        return False
+
+    def _verify_job_document(
+        self, job, allow_no_document=False, identity_only=False
+    ):
+        """Verify the job's document is still the active one before acting on it.
+
+        identity_only=True uses the cheap GET /api/tool/identity probe (~16 ms, no
+        feature-tree walk) and is valid wherever the caller consumes ONLY the identity
+        fields (activeDocument/activeDocumentPath/documentType/isDirty) — the same
+        same_document predicate decides, so ACTIVE_DOCUMENT_CHANGED detection is exactly as
+        strong. Callers that read CAD content from the returned state must keep the default
+        (full verify_state).
+        """
+        response = (
+            backend.identity() if identity_only else backend.verify_state()
+        )
         if response.get("status") != "COMPLETED":
             error = self._response_error(response)
             if allow_no_document and error.get("code") == "NO_ACTIVE_DOCUMENT":
@@ -589,7 +1561,10 @@ class CadOrchestrator:
             char if char.isalnum() or char in "._-" else "_"
             for char in (value or "unsaved")
         )
-        return text[:120] or "document"
+        # A name made only of dots ("..", ".") would be a traversal / self-reference as a
+        # path segment, so strip the leading dots and fall back to a literal word.
+        text = text.lstrip(".")[:120]
+        return text or "document"
 
     def _backup_once(self, job, state):
         source = state.get("activeDocumentPath") or ""
@@ -636,6 +1611,59 @@ class CadOrchestrator:
         job_store.save(job)
         return str(destination)
 
+    @staticmethod
+    def _document_label(job):
+        """Human-readable name of the document a pending action will act on."""
+        expected = job.get("expected_document") or {}
+        state = job.get("last_state") or {}
+        return (
+            expected.get("path")
+            or expected.get("title")
+            or state.get("activeDocumentPath")
+            or state.get("activeDocument")
+            or "unknown document"
+        )
+
+    def _edits_summary(self, job, edits):
+        return (
+            f"Apply edits to '{self._document_label(job)}': "
+            + ", ".join(
+                f"{item['tool']}({json.dumps(item['params'], ensure_ascii=False)})"
+                for item in edits
+            )
+        )
+
+    def _feature_graph_summary(self, job, graph, fresh_document):
+        return (
+            f"Build {len(graph.get('nodes') or [])} Feature Graph nodes in "
+            + (
+                "a new document."
+                if fresh_document
+                else f"'{self._document_label(job)}' (active document)."
+            )
+        )
+
+    @staticmethod
+    def _validate_feature_graph_before_confirmation(graph):
+        """Reject malformed batch graphs before they enter the confirmation queue.
+
+        The deterministic compiler already validates immediately before execution. Large graphs,
+        however, are queued for approval first; without this early check a bad units/ref/profile
+        shape consumes a confirmation round and only fails after the user approves it. Keep the
+        compiler's final validation as the authoritative second check.
+        """
+        from pycompiler.ir_schema import validate
+
+        errors = validate(graph)
+        if errors:
+            raise RuntimeError("VALIDATION_FAILED: " + "; ".join(errors) + NOTHING_BUILT)
+
+    def _drawing_summary(self, job, count):
+        return (
+            f"Create a drawing from '{self._document_label(job)}' and execute "
+            f"{count} drawing steps."
+        )
+
     def _queue_confirmation(self, job, kind, payload, risk, summary):
         action_id = str(uuid.uuid4())
         confirmation_text = f"CONFIRM {action_id}"
@@ -671,32 +1699,94 @@ class CadOrchestrator:
             payload.get("operation") == "close"
             and payload.get("close_all", False)
         )
+        # Assessment reads only identity fields (documentType, paths, isDirty) off the state,
+        # so the cheap identity probe is enough here.
         state, _ = self._verify_job_document(
-            job, allow_no_document=allow_no_document
+            job, allow_no_document=allow_no_document, identity_only=True
         )
         normalized = validate_save_or_export_payload(payload, state)
         operation = normalized["operation"]
+        if operation in ("save", "export", "batch_export"):
+            self._file_write_identity(job, state)
+        target_document = self._document_label(job)
         risk = "write"
         if operation == "save":
-            target = normalized["file_path"] or state.get(
-                "activeDocumentPath", ""
+            active_path = state.get("activeDocumentPath") or ""
+            target = normalized["file_path"] or active_path
+            # SAFETY: SolidWorks treats a save that NAMES A PATH as Save As whenever the
+            # document does not already live at that path, which RENAMES the open document in
+            # memory — the open document silently becomes the new file. That includes the
+            # FIRST save of an untitled document, even one this job created: an unsaved
+            # document is bound by TITLE only (same_document compares titles when there is no
+            # path), so a title collision could point an unconfirmed first save at the USER's
+            # document. Every such save therefore requires explicit confirmation naming the
+            # document and the target path. A save without file_path (in place) keeps the
+            # existing overwrite rule.
+            renames_open_document = bool(
+                normalized["file_path"]
+                and (
+                    not active_path
+                    or normalize_path(normalized["file_path"])
+                    != normalize_path(active_path)
+                )
             )
-            risk = "overwrite" if output_exists(target) else "write"
-            summary = f"Save the active document to '{target}'."
+            # User decision 2026-10-31: the FIRST save of the part this job created, to a path that
+            # does not exist yet, needs no confirmation. The title-collision hazard above no longer
+            # applies once the ACTIVE document is this job's own instance by the execution layer's
+            # stable document_id (not by title), so that one case is exempt; every other rename and
+            # every overwrite still confirms.
+            first_save_of_own_part = False
+            owned_id = (job.get("created_document_identity") or {}).get("document_id")
+            if (renames_open_document and owned_id and not active_path
+                    and job.get("document_origin") == ORIGIN_CREATED
+                    and not output_exists(normalized["file_path"])):
+                try:
+                    active = backend.documents().get("active_document") or {}
+                except Exception:
+                    active = {}
+                first_save_of_own_part = active.get("document_id") == owned_id
+            if first_save_of_own_part:
+                summary = (
+                    f"Save the new part '{target_document}' this job created to the new file "
+                    f"'{normalized['file_path']}'."
+                )
+            elif renames_open_document:
+                risk = "save_as"
+                origin = (
+                    active_path
+                    or state.get("activeDocument")
+                    or "an untitled document"
+                )
+                summary = (
+                    f"Save As: the active document '{target_document}' (open as "
+                    f"'{origin}') will be saved to '{normalized['file_path']}', "
+                    "renaming the open document in memory."
+                )
+            else:
+                risk = "overwrite" if output_exists(target) else "write"
+                summary = (
+                    f"Save the active document '{target_document}' to '{target}'."
+                )
         elif operation == "export":
             target = expected_output_paths(normalized, state)[0]
             risk = "overwrite" if output_exists(target) else "write"
             summary = (
-                f"Export the active document as {normalized['format']} "
-                f"to '{target}'."
+                f"Export the active document '{target_document}' as "
+                f"{normalized['format']} to '{target}'."
             )
         elif operation == "batch_export":
-            risk = "batch"
+            targets = expected_output_paths(normalized, state)
+            existing = [path for path in targets if output_exists(path)]
+            risk = "overwrite" if existing else "batch"
             summary = (
-                f"Batch export the active document from base path "
+                f"Batch export the active document '{target_document}' from base path "
                 f"'{normalized['file_path']}' using formats "
                 f"{normalized['formats_json']}."
             )
+            if existing:
+                summary += " Existing files will be overwritten: " + ", ".join(
+                    f"'{path}'" for path in existing
+                ) + "."
         else:
             dirty_discard = (
                 bool(state.get("isDirty"))
@@ -710,12 +1800,18 @@ class CadOrchestrator:
             ):
                 risk = "overwrite"
             summary = (
-                f"Close {'all documents' if normalized['close_all'] else 'the active document'}; "
+                f"Close {'all documents' if normalized['close_all'] else f'the active document {target_document!r}'}; "
                 f"save_before_close={normalized['save_before_close']}."
             )
         return normalized, state, risk, summary
 
     def _reassess_risk(self, kind, payload, job):
+        """Re-derive (payload, risk, summary, verified_state) for a pending action.
+
+        The 4th value is the identity state this call just read for `save_or_export`, handed to
+        the executor so the approved write is not preceded by a SECOND identical probe (SPEED
+        #3). Empty for the other kinds, which read the document themselves.
+        """
         if kind == "feature_graph":
             graph = payload.get("graph")
             if not isinstance(graph, dict):
@@ -723,32 +1819,31 @@ class CadOrchestrator:
             normalized = {
                 "graph": graph,
                 "fresh_document": bool(payload.get("fresh_document", True)),
+                "repair_evidence": payload.get("repair_evidence") or {},
             }
-            risk = graph_risk(graph)
-            summary = (
-                f"Build {len(graph.get('nodes') or [])} Feature Graph nodes "
-                f"({'new document' if normalized['fresh_document'] else 'active document'})."
+            risk = graph_risk(graph, normalized["fresh_document"])
+            summary = self._feature_graph_summary(
+                job, graph, normalized["fresh_document"]
             )
-            return normalized, risk, summary
+            normalized, risk, summary, _ = self._prepare_recovery_action(job, kind, normalized, risk, summary)
+            return normalized, risk, summary, {}
         if kind == "document_edits":
             edits = validate_edits(payload.get("operations"))
             risk = edits_risk(edits)
-            summary = "Apply edits: " + ", ".join(
-                f"{item['tool']}({json.dumps(item['params'], ensure_ascii=False)})"
-                for item in edits
-            )
-            return {"operations": edits}, risk, summary
+            summary = self._edits_summary(job, edits)
+            normalized, risk, summary, _ = self._prepare_recovery_action(job, kind, {"operations": edits}, risk, summary)
+            return normalized, risk, summary, {}
         if kind == "drawing_workflow":
             normalized = validate_drawing_workflow(payload)
             count = self._drawing_step_count(normalized)
             risk = "batch" if count > 7 else "write"
-            summary = f"Create a drawing and execute {count} drawing steps."
-            return normalized, risk, summary
+            summary = self._drawing_summary(job, count)
+            return normalized, risk, summary, {}
         if kind == "save_or_export":
-            normalized, _, risk, summary = self._assess_save_or_export(
+            normalized, state, risk, summary = self._assess_save_or_export(
                 job, payload
             )
-            return normalized, risk, summary
+            return normalized, risk, summary, state
         raise ValueError(f"Unsupported pending action kind: {kind}")
 
     def request_confirmation(self, job_id, job_token, action_id):
@@ -820,17 +1915,44 @@ class CadOrchestrator:
                     f"user_confirmation must exactly equal: {action.get('confirmation_text')}"
                 )
             if not isinstance(action_summary, str) or not hmac.compare_digest(
-                action_summary, action.get("summary", "")
+                action_summary.encode("utf-8"),
+                action.get("summary", "").encode("utf-8"),
             ):
                 raise PermissionError(
                     "action_summary must exactly equal the pending action summary"
                 )
             if payload_hash(action.get("payload")) != action.get("payload_hash"):
                 raise PermissionError("Pending action parameters changed after approval")
-
             kind = action["kind"]
-            payload, current_risk, current_summary = self._reassess_risk(
-                kind, action["payload"], job
+            if kind != "feature_graph":
+                self._require_no_pending_feature_graph(
+                    job, f"confirm_action({kind})"
+                )
+                is_unbound_close_all = (
+                    kind == "save_or_export"
+                    and action.get("payload", {}).get("operation") == "close"
+                    and action.get("payload", {}).get("close_all")
+                    and self._job_is_unbound(job)
+                )
+                if not is_unbound_close_all:
+                    self._require_bound_job(job, f"confirm_action({kind})")
+                    self._require_document_write_access(job, f"confirm_action({kind})")
+            # Re-check the binding at approval time: the job may still be unbound (or may have
+            # been left unbound by a failed create), in which case executing the action would
+            # act on whatever document the user has open. Only the job's own document-creating
+            # actions may bind it.
+            if self._job_is_unbound(job) and not self._action_creates_document(
+                action["kind"], action["payload"]
+            ):
+                raise RuntimeError(
+                    "JOB_DOCUMENT_UNBOUND: this CAD job is not bound to a document, "
+                    "so the approved action is refused. Start a new job with "
+                    "target_document (or open the document first and start a new job), "
+                    "then retry."
+                )
+
+            payload, current_risk, current_summary, assessed_state = (
+                self._reassess_risk(kind, action["payload"], job)
             )
             if (
                 current_risk != action["risk"]
@@ -859,41 +1981,197 @@ class CadOrchestrator:
             action["consumed_at"] = utc_now()
             job_store.save(job)
             if kind == "feature_graph":
-                return self._execute_feature_graph(job, payload, current_risk)
+                return self._execute_feature_graph(job, payload, current_risk, confirmed=True)
             if kind == "document_edits":
-                return self._execute_document_edits(job, payload, current_risk)
+                return self._execute_document_edits(job, payload, current_risk, confirmed=True)
             if kind == "drawing_workflow":
                 return self._execute_drawing_workflow(job, payload, current_risk)
             if kind == "save_or_export":
-                return self._execute_save_or_export(job, payload, current_risk)
+                # The reassessment above just read the document identity; hand it over so the
+                # approved write is guarded once, not twice (SPEED #3).
+                return self._execute_save_or_export(
+                    job, payload, current_risk, verified_state=assessed_state
+                )
             raise ValueError(f"Unsupported pending action kind: {kind}")
 
-    def feature_graph(self, job_id, job_token, graph_json, fresh_document=True):
+    def cancel_action(self, job_id, job_token, action_id):
+        """Cancel a queued action without executing it; used to release dependent write guards."""
+        with self._write_lock:
+            job = self._load_job(job_id, job_token)
+            action = (job.get("pending_actions") or {}).get(action_id)
+            if not action:
+                raise ValueError(f"Unknown pending action: {action_id}")
+            if action.get("consumed"):
+                raise ValueError("Pending action has already been consumed")
+            action["consumed"] = True
+            action["cancelled"] = True
+            action["cancelled_at"] = utc_now()
+            job_store.save(job)
+            return envelope(
+                status="cancelled",
+                job_id=job_id,
+                action_id=action_id,
+                target_document=self._target(job.get("last_state") or {}),
+                instruction="The pending action was cancelled and was not executed.",
+                **self._job_metadata(job),
+            )
+
+    def feature_graph(self, job_id, job_token, graph_json, fresh_document=True, repair_evidence_json="{}",
+                      require_expect=False):
+        """require_expect: the DSH tool sets it — a new part must state the approved plan's envelope
+        (graph.expect.bbox_mm) so the build can be checked against it (_plan_check)."""
         graph = json.loads(graph_json)
         if not isinstance(graph, dict):
             raise ValueError("graph_json must decode to a JSON object")
-        payload = {"graph": graph, "fresh_document": bool(fresh_document)}
-        risk = graph_risk(graph)
+        payload = {"graph": graph, "fresh_document": bool(fresh_document),
+                   "repair_evidence": repair_evidence(repair_evidence_json)}
+        risk = graph_risk(graph, payload["fresh_document"])
         with self._write_lock:
             job = self._load_job(job_id, job_token)
-            if risk == "batch":
-                return self._queue_confirmation(
-                    job,
-                    "feature_graph",
-                    payload,
-                    risk,
-                    f"Build {len(graph.get('nodes') or [])} Feature Graph nodes "
-                    f"({'new document' if fresh_document else 'active document'}).",
+            self._require_no_pending_feature_graph(job, "submit_feature_graph")
+            if not payload["fresh_document"]:
+                self._require_bound_job(job, "submit_feature_graph with fresh_document=false")
+                self._require_document_write_access(job, "submit_feature_graph")
+            try:
+                if payload["fresh_document"] and require_expect and not (
+                        isinstance(graph.get("expect"), dict) and "bbox_mm" in graph["expect"]):
+                    raise RuntimeError(
+                        "VALIDATION_FAILED: a fresh_document graph must carry graph.expect.bbox_mm — the "
+                        "overall envelope in millimetres stated in the approved plan (plus volume_mm3 and "
+                        "features when the plan has them); the server checks the build against it."
+                        + NOTHING_BUILT)
+                self._validate_feature_graph_before_confirmation(graph)
+            except RuntimeError:
+                if payload["fresh_document"]:
+                    self._note_validation_failure()
+                raise
+            try:
+                payload, risk, summary, _ = self._prepare_recovery_action(
+                    job, "feature_graph", payload, risk,
+                    self._feature_graph_summary(job, graph, fresh_document))
+            except IdenticalReplayError as exc:
+                message = str(exc).partition(": ")[2] or str(exc)
+                return envelope(
+                    status="failed",
+                    risk="read",
+                    job_id=job_id,
+                    action_id=None,
+                    error={"code": "REPAIR_IDENTICAL_REPLAY", "message": message},
+                    attempt_execution_status="not_started",
+                    instruction=(
+                        "The repeated graph was rejected without creating a pending action; "
+                        "correct the failed node and resubmit with repair_evidence_json. "
+                        "No cancel_action or user confirmation is needed for this rejection."
+                    ),
+                    **self._job_metadata(job),
                 )
+            if risk == "batch":
+                return self._queue_confirmation(job, "feature_graph", payload, risk, summary)
             return self._execute_feature_graph(job, payload, risk)
 
-    def _execute_feature_graph(self, job, payload, risk):
+    @staticmethod
+    def _note_validation_failure():
+        """Record on the open chain's last attempt that a graph was rejected before running.
+
+        A repair may cite VALIDATION_FAILED instead of the executed error only when this
+        happened since that attempt; otherwise any repair could cite it and the evidence check
+        would compare nothing (repair_policy.admit).
+        """
+        with job_store.recovery_chain() as ledger:
+            attempts = (ledger.get("active") or {}).get("attempts") or []
+            if attempts:
+                attempts[-1]["validation_failures"] = attempts[-1].get("validation_failures", 0) + 1
+
+    def _execute_feature_graph(self, job, payload, risk, confirmed=False):
+        payload, risk, baseline, pending = self._authorize_recovery_execution(
+            job, "feature_graph", payload, risk,
+            self._feature_graph_summary(job, payload["graph"], payload["fresh_document"]), confirmed)
+        if pending:
+            return pending
+        # Archive and reserve under the same cross-process ledger lock.
+        stale = False
+        with job_store.recovery_chain() as ledger:
+            scope = payload.get("recovery_override")
+            if scope and not self._override_is_current(ledger, scope):
+                stale = True
+            elif not scope:
+                reasons, _ = self._recovery_reasons(job, "feature_graph", payload, ledger, baseline)
+                stale = bool(reasons)
+            if not stale and scope:
+                self._archive_user_override(job, ledger, scope)
+            if not stale and not payload["fresh_document"]:
+                job_store.save(job)
+            elif not stale:
+                chain = ledger.get("active")
+                design, representation = graph_fingerprints(payload["graph"])
+                if not chain:
+                    chain = {"chain_id": str(uuid.uuid4()), "design": design,
+                             "design_contract": design_contract(payload["graph"]), "contract_version": 2,
+                             "drawing_path": job.get("drawing_path"),
+                             "baseline": baseline, "attempts": []}
+                    ledger["active"] = chain
+                attempt = {"attempt_id": str(uuid.uuid4()), "job_id": job["job_id"], "at": utc_now(),
+                           "pid": os.getpid(),
+                           "representation": representation, "evidence_hash": payload_hash(payload.get("repair_evidence") or {}),
+                           "evidence": payload.get("repair_evidence") or {}, "recovery_status": "in_flight"}
+                chain["attempts"].append(attempt)
+                # The lock follows the latest admitted graph: equal to the old one for an ordinary
+                # repair, and the corrected dimensions after a PLAN_MISMATCH repair (admit), which
+                # the next repair of this chain must then keep.
+                chain.update(design=design, design_contract=design_contract(payload["graph"]))
+                chain_id = chain["chain_id"]
+                job["repair_chain_id"] = chain_id
+                job["repair_attempts_used"] = len(chain["attempts"])-1
+                job["documents_before_create"] = baseline
+                job_store.save(job)
+        if stale:
+            return self._queue_refreshed_recovery(job, "feature_graph", payload, risk,
+                self._feature_graph_summary(job, payload["graph"], payload["fresh_document"]))
+        progress = {}
+        active_attempt_id = attempt["attempt_id"] if payload["fresh_document"] else None
+        if active_attempt_id:
+            with _ACTIVE_ATTEMPTS_LOCK:
+                _ACTIVE_ATTEMPT_IDS.add(active_attempt_id)
+        try:
+            try:
+                response = self._run_feature_graph_attempt(job, payload, risk, progress)
+            except Exception as exc:
+                response = self._uncertain_attempt_response(job, payload, risk, progress, exc)
+        finally:
+            if active_attempt_id:
+                with _ACTIVE_ATTEMPTS_LOCK:
+                    _ACTIVE_ATTEMPT_IDS.discard(active_attempt_id)
+        if not payload["fresh_document"]:
+            return response
+        with job_store.recovery_chain() as ledger:
+            chain = ledger.get("active")
+            if not chain or chain["chain_id"] != chain_id:
+                # A separately confirmed override may have archived an in-flight chain.
+                chain = next(c for c in ledger["history"] if c["chain_id"] == chain_id)
+            record = next(a for a in chain["attempts"] if a["attempt_id"] == attempt["attempt_id"])
+            record.update(recovery_status=response["recovery_status"],error_code=(response.get("error") or {}).get("code"),status=response["status"])
+            if response["status"] == "completed" and ledger.get("active") is chain:
+                chain.update(closed_by="completed", closed_at=utc_now())
+                ledger["history"].append(chain)
+                ledger["active"] = None
+        return response
+
+    def _run_feature_graph_attempt(self, job, payload, risk, progress=None):
+        # progress: how far the attempt got, for _uncertain_attempt_response if it raises.
+        progress = {} if progress is None else progress
+        self._plan_features(job, payload["graph"])
         fresh_document = payload["fresh_document"]
+        job["current_graph_fresh"] = fresh_document
         backup_path = None
         previous_identity = dict(job.get("expected_document") or {})
+        progress["previous_identity"] = previous_identity
         before = {}
 
         if fresh_document:
+            job["previous_document_write_allowed"] = bool(
+                job.get("document_write_allowed", False)
+            )
+            job_store.save(job)
             opened = backend.call(
                 "open_new_assembly"
                 if self._graph_is_assembly(payload["graph"])
@@ -901,6 +2179,8 @@ class CadOrchestrator:
                 {},
             )
             if opened.get("status") != "COMPLETED":
+                job.pop("previous_document_write_allowed", None)
+                job_store.save(job)
                 error = self._response_error(opened)
                 self._record_failure(
                     job,
@@ -920,17 +2200,28 @@ class CadOrchestrator:
                     **self._job_metadata(job),
                 )
             before = cad_state(opened)
-            verified = backend.verify_state()
+            # SPEED (#2): what follows compares the document the layer just created against
+            # what is actually active — `same_document`, i.e. title/path/type only. The identity
+            # probe answers that; the feature walk answered nothing extra (measured 442.7 ms of
+            # a 3026.5 ms single-node graph submit).
+            verified = backend.identity()
             current = (
                 cad_state(verified)
                 if verified.get("status") == "COMPLETED"
                 else {}
             )
-            created_identity = self._identity(before)
+            created_identity = self._capture_created_identity(
+                job,
+                self._identity(before),
+                (opened.get("result_geometry") or {}).get("created_document_id"),
+            )
+            progress["created_identity"] = created_identity
             if (
                 verified.get("status") != "COMPLETED"
+                or not created_identity.get("document_id")
                 or not same_document(created_identity, current)
             ):
+                progress["scope"] = "recovered"
                 recovery_status, recovered_state, recovery = (
                     self._close_created_document(
                         job,
@@ -946,6 +2237,11 @@ class CadOrchestrator:
                         "verified as the active transaction target."
                     ),
                 }
+                # The created document was discarded; report IT as the write target and
+                # surface the re-activated previous document separately (see _discard_report).
+                discard_extras, discarded_target = self._discard_report(
+                    recovery_status, recovery, created_identity, recovered_state
+                )
                 self._record_failure(
                     job,
                     kind="feature_graph",
@@ -953,7 +2249,7 @@ class CadOrchestrator:
                     error=error,
                     execution_status=(
                         "failed"
-                        if recovery_status == "rolled_back"
+                        if recovery_status == "discarded"
                         else "partial"
                     ),
                     verification_status_value="failed",
@@ -963,12 +2259,13 @@ class CadOrchestrator:
                 return envelope(
                     status=(
                         "failed"
-                        if recovery_status == "rolled_back"
+                        if recovery_status == "discarded"
                         else "partial"
                     ),
                     risk=risk,
                     job_id=job["job_id"],
-                    target_document=self._target(recovered_state),
+                    target_document=discarded_target
+                    or self._target(recovered_state),
                     partial_state=recovered_state,
                     verification={
                         "state": verified,
@@ -976,19 +2273,29 @@ class CadOrchestrator:
                         "available": verified.get("status") == "COMPLETED",
                     },
                     error=error,
+                    **discard_extras,
                     **self._job_metadata(job),
                 )
             before = current
-            job["expected_document"] = self._identity(current)
+            job["expected_document"] = created_identity
+            job["document_origin"] = ORIGIN_CREATED
+            job["document_write_allowed"] = True
             job["last_state"] = current
             job_store.save(job)
         else:
+            # Recovery/override authorization already ran before entering this attempt.
             before, _ = self._verify_job_document(job)
+            progress["previous_identity"] = self._identity(before)
             backup_path = self._backup_once(job, before)
 
         transaction_name = "DSH Feature Graph"
+        # Set before the request: a begin that timed out on this side may still have opened the
+        # scope in the execution service.
+        progress["scope"] = "requested"
         begin_error = self._begin_transaction(job, transaction_name)
         if begin_error:
+            # Refused, often UNDO_SCOPE_ACTIVE: any open scope is another document's, never roll it back.
+            progress["scope"] = "refused"
             recovery_status = "backup_only" if backup_path else "not_needed"
             recovery = None
             state = before
@@ -1008,23 +2315,30 @@ class CadOrchestrator:
                 error=begin_error,
                 execution_status=(
                     "partial"
-                    if recovery_status == "rollback_failed"
+                    if recovery_status in ("rollback_failed", "recovery_unverified")
                     else "failed"
                 ),
                 verification_status_value="not_run",
                 recovery_status=recovery_status,
                 recovery=recovery,
             )
+            discard_extras, discarded_target = self._discard_report(
+                recovery_status,
+                recovery,
+                self._identity(before) if fresh_document else None,
+                state,
+            )
             return envelope(
                 status="failed"
-                if recovery_status != "rollback_failed"
+                if recovery_status not in ("rollback_failed", "recovery_unverified")
                 else "partial",
                 risk=risk,
                 job_id=job["job_id"],
-                target_document=self._target(state),
+                target_document=discarded_target or self._target(state),
                 backup_path=backup_path,
                 partial_state=state,
                 error=begin_error,
+                **discard_extras,
                 **self._job_metadata(job),
             )
 
@@ -1038,6 +2352,7 @@ class CadOrchestrator:
             if item.get("status") == "COMPLETED"
         ]
         if response.get("status") != "COMPLETED":
+            progress["scope"] = "recovered"
             recovery_status, state, recovery = self._recover_transaction(
                 job,
                 kind="feature_graph",
@@ -1049,7 +2364,7 @@ class CadOrchestrator:
             verification = {
                 "state": recovery.get("verification"),
                 "deep_checks": [],
-                "all_completed": recovery_status == "rolled_back",
+                "all_completed": False,
                 "available": (
                     (recovery.get("verification") or {}).get("status")
                     == "COMPLETED"
@@ -1063,13 +2378,22 @@ class CadOrchestrator:
                     )
                 ),
             }
+            exec_error = response.get("error") or {
+                "code": "FEATURE_GRAPH_FAILED",
+                "message": "Compiler failed.",
+            }
+            verification["diagnostic_attribution"] = build_diagnostic_attribution(
+                graph=payload["graph"],
+                verification=verification,
+                compiler=compiler,
+                error=exec_error,
+            )
             return self._transaction_failure_response(
                 job,
                 kind="feature_graph",
                 phase="execution",
                 risk=risk,
-                error=response.get("error")
-                or {"code": "FEATURE_GRAPH_FAILED", "message": "Compiler failed."},
+                error=exec_error,
                 verification=verification,
                 recovery_status=recovery_status,
                 recovery_event=recovery,
@@ -1077,6 +2401,9 @@ class CadOrchestrator:
                 partial_state={"cad": state, "compiler": compiler},
                 target_state=state,
                 backup_path=backup_path,
+                created_identity=job.get("created_document_identity")
+                if fresh_document
+                else None,
             )
 
         try:
@@ -1090,6 +2417,7 @@ class CadOrchestrator:
                 "available": False,
             }
         if not verification.get("all_completed"):
+            progress["scope"] = "recovered"
             recovery_status, recovered_state, recovery = (
                 self._recover_transaction(
                     job,
@@ -1099,19 +2427,26 @@ class CadOrchestrator:
                     else self._identity(before),
                     newly_created=fresh_document,
                 )
+            )
+            post_error = {
+                "code": "POST_VERIFICATION_FAILED",
+                "message": (
+                    "The Feature Graph executed, but objective "
+                    "post-verification did not pass."
+                ),
+            }
+            verification["diagnostic_attribution"] = build_diagnostic_attribution(
+                graph=payload["graph"],
+                verification=verification,
+                compiler=compiler,
+                error=post_error,
             )
             return self._transaction_failure_response(
                 job,
                 kind="feature_graph",
                 phase="verification",
                 risk=risk,
-                error={
-                    "code": "POST_VERIFICATION_FAILED",
-                    "message": (
-                        "The Feature Graph executed, but objective "
-                        "post-verification did not pass."
-                    ),
-                },
+                error=post_error,
                 verification=verification,
                 recovery_status=recovery_status,
                 recovery_event=recovery,
@@ -1119,10 +2454,61 @@ class CadOrchestrator:
                 partial_state={"cad": recovered_state, "compiler": compiler},
                 target_state=recovered_state,
                 backup_path=backup_path,
+                created_identity=job.get("created_document_identity")
+                if fresh_document
+                else None,
             )
+
+        plan = self._plan_check(payload["graph"], verification)
+        if plan is not None:
+            verification["plan_check"] = plan
+            job["plan_check"] = plan
+            job_store.save(job)
+        if plan is not None and plan["bbox_ok"] is False and fresh_document:
+            # Built cleanly, but not the part the user approved: discarded like any failed
+            # verification, so the repair runs on a clean slate and counts against the budget.
+            verification["all_completed"] = False
+            job.pop("verification_stamp", None)
+            progress["scope"] = "recovered"
+            recovery_status, recovered_state, recovery = self._recover_transaction(
+                job, kind="feature_graph", previous_identity=previous_identity, newly_created=True)
+            mismatch_error = {
+                "code": "PLAN_MISMATCH",
+                "message": plan["message"] + "这个新零件已丢弃，修复从干净状态开始，计入 2 次修复预算。",
+                "expected_bbox_mm": plan["expected_bbox_mm"],
+                "built_bbox_mm": plan["built_bbox_mm"],
+                "attribution_category": "plan_vs_cad_mismatch",
+            }
+            verification["diagnostic_attribution"] = build_diagnostic_attribution(
+                graph=payload["graph"],
+                verification=verification,
+                compiler=compiler,
+                plan_check=plan,
+                error=mismatch_error,
+            )
+            return self._transaction_failure_response(
+                job,
+                kind="feature_graph",
+                phase="verification",
+                risk=risk,
+                error=mismatch_error,
+                verification=verification,
+                recovery_status=recovery_status,
+                recovery_event=recovery,
+                completed_steps=completed,
+                partial_state={"cad": recovered_state, "compiler": compiler},
+                target_state=recovered_state,
+                backup_path=backup_path,
+                created_identity=job.get("created_document_identity"),
+            )
+
+        # Optional ledger diagnostics are sampled against the same locked job document.
+        # They can add warnings, but never enter the transaction failure / rollback path.
+        ledger_warnings = self._dimension_ledger_warnings(payload["graph"], verification)
 
         committed = backend.commit_transaction(transaction_name)
         if committed.get("status") != "COMPLETED":
+            progress["scope"] = "recovered"
             recovery_status, recovered_state, recovery = (
                 self._recover_transaction(
                     job,
@@ -1133,12 +2519,21 @@ class CadOrchestrator:
                     newly_created=fresh_document,
                 )
             )
+            commit_error = self._response_error(committed)
+            verification["diagnostic_attribution"] = build_diagnostic_attribution(
+                graph=payload["graph"],
+                verification=verification,
+                compiler=compiler,
+                plan_check=plan,
+                warnings=ledger_warnings,
+                error=commit_error,
+            )
             return self._transaction_failure_response(
                 job,
                 kind="feature_graph",
                 phase="commit",
                 risk=risk,
-                error=self._response_error(committed),
+                error=commit_error,
                 verification=verification,
                 recovery_status=recovery_status,
                 recovery_event=recovery,
@@ -1146,8 +2541,12 @@ class CadOrchestrator:
                 partial_state={"cad": recovered_state, "compiler": compiler},
                 target_state=recovered_state,
                 backup_path=backup_path,
+                created_identity=job.get("created_document_identity")
+                if fresh_document
+                else None,
             )
 
+        progress["scope"] = "committed"
         job["completed_steps"].append(
             {
                 "kind": "feature_graph",
@@ -1155,7 +2554,38 @@ class CadOrchestrator:
                 "nodes": compiler.get("nodes_completed"),
             }
         )
+        self._record_built_features(job, compiler, payload["graph"],
+                                    fresh_document=payload["fresh_document"])
+        job["dimension_ledger_warnings"] = ledger_warnings
+        job["last_graph_plan_summary"] = extract_planned_by_model(payload["graph"])
+        job["last_compiler_warnings"] = list(compiler.get("warnings") or [])
+        ledger = payload["graph"].get("dimension_ledger")
+        job["dimension_ledger_measured"] = sum(
+            1 for item in ledger
+            if isinstance(item, dict) and item.get("source_kind") != "unknown" and isinstance(item.get("check"), dict)
+        ) if isinstance(ledger, list) else 0
         self._record_success(job, "feature_graph", "built_unverified")
+        job.pop("previous_document_write_allowed", None)
+        job_store.save(job)
+        # A non-fatal compiler finding (today: MATERIAL_NOT_FOUND) — the geometry is committed and
+        # the document just lacks the requested property. Emitted only when there IS one, and
+        # never as `error`: a warning that reads as a failure invites a rollback of good work.
+        warnings = (list(compiler.get("warnings") or [])
+                    + list((plan or {}).get("warnings") or [])
+                    + ledger_warnings)
+        attribution = build_diagnostic_attribution(
+            graph=payload["graph"],
+            planned_summary=job["last_graph_plan_summary"],
+            verification=verification,
+            compiler=compiler,
+            plan_check=plan,
+            warnings=warnings,
+            built_feature_types=job.get("built_feature_types"),
+        )
+        verification["diagnostic_attribution"] = attribution
+        extras = {"diagnostic_attribution": attribution}
+        if warnings:
+            extras["warnings"] = warnings
         return envelope(
             status="completed",
             risk=risk,
@@ -1165,6 +2595,7 @@ class CadOrchestrator:
             completed_steps=completed,
             partial_state={"cad": state, "compiler": compiler},
             verification=verification,
+            **extras,
             **self._job_metadata(job),
         )
 
@@ -1174,21 +2605,34 @@ class CadOrchestrator:
         risk = edits_risk(edits)
         with self._write_lock:
             job = self._load_job(job_id, job_token)
+            self._require_bound_job(job, "apply_document_edits")
+            self._require_document_write_access(job, "apply_document_edits")
+            payload, risk, summary, _ = self._prepare_recovery_action(
+                job, "document_edits", payload, risk, self._edits_summary(job, edits))
             if risk in ("destructive", "batch"):
                 return self._queue_confirmation(
                     job,
                     "document_edits",
                     payload,
                     risk,
-                    "Apply edits: "
-                    + ", ".join(
-                        f"{item['tool']}({json.dumps(item['params'], ensure_ascii=False)})"
-                        for item in edits
-                    ),
+                    summary,
                 )
             return self._execute_document_edits(job, payload, risk)
 
-    def _execute_document_edits(self, job, payload, risk):
+    def _execute_document_edits(self, job, payload, risk, confirmed=False):
+        payload, risk, _, pending = self._authorize_recovery_execution(
+            job, "document_edits", payload, risk, self._edits_summary(job, payload["operations"]), confirmed)
+        if pending:
+            return pending
+        if payload.get("recovery_override"):
+            with job_store.recovery_chain() as ledger:
+                stale = not self._override_is_current(ledger, payload["recovery_override"])
+                if not stale:
+                    self._archive_user_override(job, ledger, payload["recovery_override"])
+            if stale:
+                return self._queue_refreshed_recovery(job, "document_edits", payload, risk,
+                    self._edits_summary(job, payload["operations"]))
+            job_store.save(job)
         before, _ = self._verify_job_document(job)
         backup_path = self._backup_once(job, before)
         completed = []
@@ -1220,13 +2664,13 @@ class CadOrchestrator:
 
         response = None
         failed_operation = None
+        last_step_identity = None
         for edit in payload["operations"]:
             response = backend.call(edit["tool"], edit["params"])
             if response.get("status") != "COMPLETED":
                 failed_operation = edit
                 break
-            completed.append(edit["tool"])
-            verify_response = backend.verify_state()
+            verify_response = backend.identity()
             verified_state = (
                 cad_state(verify_response)
                 if verify_response.get("status") == "COMPLETED"
@@ -1251,6 +2695,9 @@ class CadOrchestrator:
             job["last_state"] = verified_state
             job_store.save(job)
             step_states.append(verified_state)
+            completed.append(edit["tool"])
+            # The post-verify below would otherwise re-read exactly what this step just read.
+            last_step_identity = verify_response
 
         if failed_operation is not None:
             recovery_status, state, recovery = self._recover_transaction(
@@ -1263,7 +2710,7 @@ class CadOrchestrator:
             verification = {
                 "state": recovery_verify,
                 "deep_checks": [],
-                "all_completed": recovery_status == "rolled_back",
+                "all_completed": False,
                 "available": recovery_verify.get("status") == "COMPLETED",
             }
             return self._transaction_failure_response(
@@ -1285,7 +2732,22 @@ class CadOrchestrator:
                 backup_path=backup_path,
             )
 
-        state, verification = self._post_verify(job)
+        try:
+            state, verification = self._post_verify(
+                job, verified=last_step_identity
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._post_verify_failure_response(
+                job,
+                kind="document_edits",
+                risk=risk,
+                error=exc,
+                previous_identity=self._identity(before),
+                newly_created=False,
+                completed_steps=completed,
+                partial_state={"step_states": step_states},
+                backup_path=backup_path,
+            )
         if not verification.get("all_completed"):
             recovery_status, recovered_state, recovery = (
                 self._recover_transaction(
@@ -1388,24 +2850,27 @@ class CadOrchestrator:
         risk = "batch" if self._drawing_step_count(payload) > 7 else "write"
         with self._write_lock:
             job = self._load_job(job_id, job_token)
+            self._require_bound_job(job, "drawing_workflow")
+            self._require_no_pending_feature_graph(job, "drawing_workflow")
             if risk == "batch":
                 return self._queue_confirmation(
                     job,
                     "drawing_workflow",
                     payload,
                     risk,
-                    f"Create a drawing and execute {self._drawing_step_count(payload)} "
-                    "drawing steps.",
+                    self._drawing_summary(job, self._drawing_step_count(payload)),
                 )
             return self._execute_drawing_workflow(job, payload, risk)
 
     def _execute_drawing_workflow(self, job, payload, risk):
         previous_identity = dict(job.get("expected_document") or {})
         if previous_identity:
-            self._verify_job_document(job)
+            # Identity-only pre-check: nothing below reads CAD content before create_drawing.
+            self._verify_job_document(job, identity_only=True)
 
         completed = []
         step_states = []
+        job["documents_before_create"] = backend.documents()
         response = backend.call(
             "create_drawing",
             {"model_path": payload.get("model_path", "")},
@@ -1431,8 +2896,14 @@ class CadOrchestrator:
         )
 
         created_state = cad_state(response)
-        created_identity = self._identity(created_state)
-        created_verify = backend.verify_state()
+        created_identity = self._capture_created_identity(
+            job,
+            self._identity(created_state),
+            (response.get("result_geometry") or {}).get("created_document_id"),
+        )
+        # The check below compares document identity and type only — the cheap probe's
+        # cadState carries exactly those fields.
+        created_verify = backend.identity()
         state = (
             cad_state(created_verify)
             if created_verify.get("status") == "COMPLETED"
@@ -1453,6 +2924,8 @@ class CadOrchestrator:
                 ),
             }
             job["expected_document"] = created_identity
+            job["document_origin"] = ORIGIN_CREATED
+            job["document_write_allowed"] = True
             job["last_state"] = state
             self._record_failure(
                 job,
@@ -1480,6 +2953,7 @@ class CadOrchestrator:
             )
         if (
             created_verify.get("status") != "COMPLETED"
+            or not created_identity.get("document_id")
             or state.get("documentType") != "DRAWING"
         ):
             recovery_status, recovered_state, recovery = (
@@ -1497,6 +2971,9 @@ class CadOrchestrator:
                     "verified as the active workflow target."
                 ),
             }
+            discard_extras, discarded_target = self._discard_report(
+                recovery_status, recovery, created_identity, recovered_state
+            )
             self._record_failure(
                 job,
                 kind="drawing_workflow",
@@ -1504,7 +2981,7 @@ class CadOrchestrator:
                 error=error,
                 execution_status=(
                     "failed"
-                    if recovery_status == "rolled_back"
+                    if recovery_status == "discarded"
                     else "partial"
                 ),
                 verification_status_value="failed",
@@ -1514,12 +2991,13 @@ class CadOrchestrator:
             return envelope(
                 status=(
                     "failed"
-                    if recovery_status == "rolled_back"
+                    if recovery_status == "discarded"
                     else "partial"
                 ),
                 risk=risk,
                 job_id=job["job_id"],
-                target_document=self._target(recovered_state),
+                target_document=discarded_target
+                or self._target(recovered_state),
                 partial_state=recovered_state,
                 verification={
                     "state": created_verify,
@@ -1530,14 +3008,20 @@ class CadOrchestrator:
                     ),
                 },
                 error=error,
+                **discard_extras,
                 **self._job_metadata(job),
             )
 
         completed.append("create_drawing")
         step_states.append(state)
-        job["expected_document"] = self._identity(state)
+        job["expected_document"] = created_identity
+        job["document_origin"] = ORIGIN_CREATED
+        job["document_write_allowed"] = True
         job["last_state"] = state
         job_store.save(job)
+        # The identity of the drawing this workflow created: a failure later on discards it,
+        # and the failure envelope must name IT as the write target, not the restored model.
+        created_drawing_identity = created_identity
 
         transaction_name = "DSH Drawing Workflow"
         begin_error = self._begin_transaction(job, transaction_name)
@@ -1546,9 +3030,12 @@ class CadOrchestrator:
                 self._close_created_document(
                     job,
                     kind="drawing_workflow",
-                    created_identity=self._identity(state),
+                    created_identity=created_drawing_identity,
                     previous_identity=previous_identity,
                 )
+            )
+            discard_extras, discarded_target = self._discard_report(
+                recovery_status, recovery, created_identity, recovered_state
             )
             self._record_failure(
                 job,
@@ -1557,7 +3044,7 @@ class CadOrchestrator:
                 error=begin_error,
                 execution_status=(
                     "failed"
-                    if recovery_status == "rolled_back"
+                    if recovery_status == "discarded"
                     else "partial"
                 ),
                 verification_status_value="not_run",
@@ -1567,15 +3054,17 @@ class CadOrchestrator:
             return envelope(
                 status=(
                     "failed"
-                    if recovery_status == "rolled_back"
+                    if recovery_status == "discarded"
                     else "partial"
                 ),
                 risk=risk,
                 job_id=job["job_id"],
-                target_document=self._target(recovered_state),
+                target_document=discarded_target
+                or self._target(recovered_state),
                 completed_steps=completed,
                 partial_state=recovered_state,
                 error=begin_error,
+                **discard_extras,
                 **self._job_metadata(job),
             )
 
@@ -1585,15 +3074,24 @@ class CadOrchestrator:
                 "error": {"code": code, "message": message},
             }
 
+        # The identity the LAST successful step read, handed to _post_verify so the drawing
+        # workflow does not read the same document twice in a row (SPEED #3).
+        step_identity = []
+
         def run(tool, params):
-            verify_before = backend.verify_state()
+            # Per-step guards compare ONLY the document identity, so each one is the cheap
+            # GET /api/tool/identity probe instead of a full verify_state feature-tree walk.
+            # The predicate is the same same_document() the write path uses: a document
+            # switch between steps is detected identically, and backend.identity() itself
+            # falls back to full verify_state when the endpoint is unavailable.
+            identity_before = backend.identity()
             state_before = (
-                cad_state(verify_before)
-                if verify_before.get("status") == "COMPLETED"
+                cad_state(identity_before)
+                if identity_before.get("status") == "COMPLETED"
                 else {}
             )
             if (
-                verify_before.get("status") != "COMPLETED"
+                identity_before.get("status") != "COMPLETED"
                 or not same_document(job["expected_document"], state_before)
             ):
                 return failed_response(
@@ -1606,14 +3104,14 @@ class CadOrchestrator:
                 return tool_response
             completed.append(tool)
 
-            verify_after = backend.verify_state()
+            identity_after = backend.identity()
             state_after = (
-                cad_state(verify_after)
-                if verify_after.get("status") == "COMPLETED"
+                cad_state(identity_after)
+                if identity_after.get("status") == "COMPLETED"
                 else {}
             )
             if (
-                verify_after.get("status") != "COMPLETED"
+                identity_after.get("status") != "COMPLETED"
                 or not same_document(job["expected_document"], state_after)
             ):
                 return failed_response(
@@ -1624,6 +3122,7 @@ class CadOrchestrator:
             job["last_state"] = state_after
             job_store.save(job)
             step_states.append(state_after)
+            step_identity[:] = [identity_after]
             return tool_response
 
         for view in payload.get("views") or []:
@@ -1816,7 +3315,7 @@ class CadOrchestrator:
             verification = {
                 "state": recovery_verify,
                 "deep_checks": [],
-                "all_completed": recovery_status == "rolled_back",
+                "all_completed": False,
                 "available": (
                     recovery_verify.get("status") == "COMPLETED"
                     or (
@@ -1841,9 +3340,25 @@ class CadOrchestrator:
                     "step_states": step_states,
                 },
                 target_state=recovered_state,
+                created_identity=created_drawing_identity,
             )
 
-        state, verification = self._post_verify(job)
+        try:
+            state, verification = self._post_verify(
+                job, verified=(step_identity[-1] if step_identity else None)
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._post_verify_failure_response(
+                job,
+                kind="drawing_workflow",
+                risk=risk,
+                error=exc,
+                previous_identity=previous_identity,
+                newly_created=True,
+                completed_steps=completed,
+                partial_state={"step_states": step_states},
+                created_identity=created_drawing_identity,
+            )
         if not verification.get("all_completed"):
             recovery_status, recovered_state, recovery = (
                 self._recover_transaction(
@@ -1874,6 +3389,7 @@ class CadOrchestrator:
                     "step_states": step_states,
                 },
                 target_state=recovered_state,
+                created_identity=created_drawing_identity,
             )
 
         committed = backend.commit_transaction(transaction_name)
@@ -1901,6 +3417,7 @@ class CadOrchestrator:
                     "step_states": step_states,
                 },
                 target_state=recovered_state,
+                created_identity=created_drawing_identity,
             )
 
         job["completed_steps"].append(
@@ -1939,22 +3456,106 @@ class CadOrchestrator:
         }
         with self._write_lock:
             job = self._load_job(job_id, job_token)
-            payload, _, risk, summary = self._assess_save_or_export(
-                job, payload
-            )
+            self._require_no_pending_feature_graph(job, f"save_or_export({operation})")
+            # close_all intentionally targets whatever is open, so it is the one operation
+            # allowed on an unbound job; every other operation needs a bound document.
+            if not (operation == "close" and close_all):
+                self._require_bound_job(job, f"save_or_export({operation})")
+                self._require_document_write_access(job, f"save_or_export({operation})")
+            elif job.get("document_origin") == ORIGIN_PRE_EXISTING and not job.get(
+                "document_write_allowed", False
+            ):
+                raise RuntimeError(
+                    "JOB_DOCUMENT_READ_ONLY: close_all is refused because this "
+                    "targetless job is bound to a pre-existing user document."
+                )
+            try:
+                payload, assessed_state, risk, summary = (
+                    self._assess_save_or_export(job, payload)
+                )
+            except RuntimeError as exc:
+                code, _, message = str(exc).partition(": ")
+                if code not in {"ACTIVE_DOCUMENT_CHANGED", "EXECUTION_SERVICE_UPGRADE_REQUIRED",
+                                "DOCUMENT_IDENTITY_UNVERIFIED"}:
+                    raise
+                error = {"code": code, "message": message}
+                self._record_failure(job, kind="save_or_export", phase="preflight", error=error,
+                                     execution_status="failed", verification_status_value="not_run",
+                                     recovery_status=job.get("recovery_status", "not_needed"))
+                return envelope(status="failed", job_id=job_id, error=error, **self._job_metadata(job))
 
-            if risk in ("destructive", "overwrite", "batch"):
+            if risk in ("destructive", "overwrite", "save_as", "batch"):
                 return self._queue_confirmation(
                     job, "save_or_export", payload, risk, summary
                 )
-            return self._execute_save_or_export(job, payload, risk)
+            # No write happened between the assessment and the execution, and both run under
+            # this same lock: pass the identity state through instead of probing twice (#3).
+            return self._execute_save_or_export(
+                job, payload, risk, verified_state=assessed_state
+            )
 
-    def _execute_save_or_export(self, job, payload, risk):
-        state, _ = self._verify_job_document(
-            job, allow_no_document=payload.get("close_all", False)
-        )
+    def _file_write_identity(self, job, state):
+        """Bind the source instance and require an execution-side write guard."""
+        inventory = backend.documents()
+        if inventory.get("file_write_identity_guard") is not True:
+            raise RuntimeError(
+                "EXECUTION_SERVICE_UPGRADE_REQUIRED: the execution service must support "
+                "atomic source-document identity checks before saving or exporting."
+            )
+        active = inventory.get("active_document") or {}
+        expected = job.get("expected_document") or {}
+        actual_state = self._inventory_state(inventory)
+        source_id = (expected.get("document_id")
+                     or (job.get("created_document_identity") or {}).get("document_id"))
+        if not source_id:
+            raise RuntimeError(
+                "DOCUMENT_IDENTITY_UNVERIFIED: start a new job to bind the source instance "
+                "before saving or exporting."
+            )
+        if (not active.get("document_id") or not same_document(expected, actual_state)
+                or not same_document(self._identity(state), actual_state)
+                or (source_id and source_id != active["document_id"])):
+            raise RuntimeError("ACTIVE_DOCUMENT_CHANGED: file-write source no longer matches the job.")
+        source = {**self._identity(state), "document_id": active["document_id"]}
+        job["expected_document"] = source
+        job["file_write_identity_evidence"] = {"before": inventory}
+        job_store.save(job)
+        return {"expected_document_id": source["document_id"],
+                "expected_title": source["title"] or "",
+                "expected_path": source["path"] or "",
+                "expected_type": source["type"] or ""}
+
+    def _execute_save_or_export(self, job, payload, risk, verified_state=None):
+        # Like the assessment, execution consumes only identity fields off `state` (the backup
+        # source path, the document type, the close-guard identity). `verified_state` is the
+        # identity the caller just read under the same lock with the same ACTIVE_DOCUMENT_CHANGED
+        # guard, so an approved write is verified once; without it the guard runs here.
+        if verified_state:
+            state = verified_state
+        else:
+            state, _ = self._verify_job_document(
+                job,
+                allow_no_document=payload.get("close_all", False),
+                identity_only=True,
+            )
         operation = payload["operation"]
         backup_path = None
+        source_guard = {}
+        if operation in ("save", "export", "batch_export"):
+            try:
+                source_guard = self._file_write_identity(job, state)
+            except Exception as exc:
+                code, _, message = str(exc).partition(": ")
+                error = {"code": code if message else "DOCUMENT_INVENTORY_UNAVAILABLE",
+                         "message": message or str(exc)}
+                self._record_failure(
+                    job, kind="save_or_export", phase="preflight", error=error,
+                    execution_status="failed", verification_status_value="not_run",
+                    recovery_status=job.get("recovery_status", "not_needed"),
+                )
+                return envelope(status="failed", risk=risk, job_id=job["job_id"],
+                                target_document=self._target(state), error=error,
+                                **self._job_metadata(job))
         if operation == "save" or (
             operation == "close" and payload.get("save_before_close")
         ):
@@ -1962,7 +3563,7 @@ class CadOrchestrator:
 
         if operation == "save":
             response = backend.call(
-                "save_document", {"file_path": payload.get("file_path", "")}
+                "save_document", {"file_path": payload.get("file_path", ""), **source_guard}
             )
         elif operation == "export":
             response = backend.call(
@@ -1970,6 +3571,7 @@ class CadOrchestrator:
                 {
                     "format": payload.get("format", ""),
                     "file_path": payload.get("file_path", ""),
+                    **source_guard,
                 },
             )
         elif operation == "batch_export":
@@ -1978,11 +3580,15 @@ class CadOrchestrator:
                 {
                     "file_path_base": payload.get("file_path", ""),
                     "formats_json": payload.get("formats_json", "[]"),
+                    **source_guard,
                 },
             )
         else:
+            closing_identity = self._identity(state)
+            if (job.get("expected_document") or {}).get("document_id"):
+                closing_identity["document_id"] = job["expected_document"]["document_id"]
             response = self._close_document(
-                self._identity(state),
+                closing_identity,
                 save=payload.get("save_before_close", False),
                 close_all=payload.get("close_all", False),
             )
@@ -2058,9 +3664,61 @@ class CadOrchestrator:
                 "closed_document": self._identity(state),
             }
         else:
-            after, verification = self._post_verify(
-                job, update_identity=(operation == "save")
-            )
+            try:
+                after, verification = self._post_verify(
+                    job, update_identity=(operation == "save"),
+                    saved_path=(payload.get("file_path") or state.get("activeDocumentPath"))
+                    if operation == "save" else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # save/export is not wrapped in an undo scope, so there is no transaction to
+                # roll back — but the failure must still be recorded and typed instead of
+                # escaping with the job metadata untouched.
+                if isinstance(exc, ExecutionLayerError):
+                    error = {
+                        "code": "EXECUTION_LAYER_ERROR",
+                        "message": str(exc),
+                    }
+                else:
+                    error = {
+                        "code": "POST_VERIFICATION_ERROR",
+                        "message": f"{type(exc).__name__}: {exc}",
+                    }
+                self._record_failure(
+                    job,
+                    kind="save_or_export",
+                    phase="verification",
+                    error=error,
+                    execution_status="completed",
+                    verification_status_value="failed",
+                    recovery_status=(
+                        "backup_only" if backup_path else "not_needed"
+                    ),
+                )
+                return envelope(
+                    status="verification_failed",
+                    risk=risk,
+                    job_id=job["job_id"],
+                    target_document=self._target(state),
+                    backup_path=backup_path,
+                    completed_steps=[operation],
+                    partial_state=state,
+                    verification={
+                        "state": {},
+                        "deep_checks": [],
+                        "all_completed": False,
+                        "available": False,
+                        "output_files": output_checks,
+                        "all_outputs_valid": not [
+                            path
+                            for path, check in output_checks.items()
+                            if not check["valid"]
+                        ],
+                        "post_verify_error": error,
+                    },
+                    error=error,
+                    **self._job_metadata(job),
+                )
             verification["output_files"] = output_checks
 
         invalid_outputs = [
@@ -2135,8 +3793,48 @@ class CadOrchestrator:
             **self._job_metadata(job),
         )
 
-    def _post_verify(self, job, update_identity=False):
-        response = backend.verify_state()
+    def _verification_stamp(self, state, verification):
+        """The facts a LATER verification would have to re-derive, keyed by state_version.
+
+        Stored on the job after every successful post-verify (SPEED task C). A stamp is only
+        reusable while the document's state_version and identity are both unchanged: the deep
+        checks (analyze_model geometry/mass_properties, analyze_* components/mates, drawing
+        analysis) are pure functions of the geometry, so at an unchanged state_version they
+        cannot have a different answer.
+        """
+        return {
+            "state_version": state.get("stateVersion"),
+            "identity": self._identity(state),
+            "deep_checks": verification.get("deep_checks") or [],
+            "all_completed": verification.get("all_completed"),
+            "available": verification.get("available"),
+        }
+
+    def _stamp_matches(self, job, state):
+        """True when the job's last post-verify is still valid for `state`."""
+        stamp = job.get("verification_stamp") or {}
+        if not stamp or stamp.get("all_completed") is not True:
+            return False
+        if stamp.get("state_version") != state.get("stateVersion"):
+            return False
+        # Identity is compared with the SAME predicate the write path uses, so a document
+        # switch (which does NOT bump state_version — ActivateDocument leaves it alone) can
+        # never be papered over by a matching counter.
+        return same_document(stamp.get("identity") or {}, state)
+
+    def _post_verify(
+        self, job, update_identity=False, reuse_deep_checks=False, verified=None, saved_path=None
+    ):
+        # SPEED (#6): this read is used for exactly three things — the identity gate
+        # (same_document against the job's expected document), the document type that selects
+        # which deep checks to run, and the state_version the reuse stamp is keyed on. The
+        # identity probe answers all three; the geometry verdicts come from the analyze calls
+        # below, never from this response. verify_state's FeatureManager.GetFeatures(true) walk
+        # (95-145 ms here, ~2.5 s on a production part) was a duplicated read.
+        # `verified` is an identity response the caller read moments ago under the same lock
+        # with no CAD write in between (SPEED #3): reusing it removes the duplicate read while
+        # running the identical predicate on the same data.
+        response = verified if verified is not None else backend.identity()
         if response.get("status") != "COMPLETED":
             return {}, {
                 "state": response,
@@ -2147,8 +3845,26 @@ class CadOrchestrator:
         state = cad_state(response)
         identity_match = True
         identity_error = None
-        if update_identity or not job.get("expected_document"):
-            job["expected_document"] = self._identity(state)
+        if update_identity:
+            # Save As may rename this instance; a path match cannot authorize adopting another.
+            expected_id = (job.get("expected_document") or {}).get("document_id")
+            try:
+                inventory = backend.documents()
+                job.setdefault("file_write_identity_evidence", {})["after"] = inventory
+                active = inventory.get("active_document") or {}
+                identity_match = bool(
+                    expected_id and active.get("document_id") == expected_id
+                    and same_document(self._identity(state), self._inventory_state(inventory))
+                    and (not saved_path or normalize_path(active.get("path") or "")
+                         == normalize_path(str(saved_path)))
+                )
+            except Exception as exc:
+                identity_match = False
+                job.setdefault("file_write_identity_evidence", {})["after_error"] = str(exc)
+            if identity_match:
+                job["expected_document"] = {**self._identity(state), "document_id": expected_id}
+            else:
+                identity_error = "ACTIVE_DOCUMENT_CHANGED_DURING_OPERATION: saved source instance/path was not preserved."
         elif not same_document(job["expected_document"], state):
             identity_match = False
             identity_error = (
@@ -2156,12 +3872,33 @@ class CadOrchestrator:
                 f"'{job['expected_document'].get('path') or job['expected_document'].get('title')}', "
                 f"got '{self._target(state)}'"
             )
+        if not update_identity and identity_match and (job.get("expected_document") or {}).get("document_id"):
+            try:
+                inventory = backend.documents()
+                expected_id = job["expected_document"]["document_id"]
+                identity_match = bool(
+                    (inventory.get("active_document") or {}).get("document_id") == expected_id
+                    and same_document(self._identity(state), self._inventory_state(inventory))
+                )
+            except Exception:
+                identity_match = False
+            if not identity_match:
+                identity_error = "ACTIVE_DOCUMENT_CHANGED_DURING_OPERATION: bound document instance changed."
         job["last_state"] = state
         job_store.save(job)
 
         doc_type = state.get("documentType")
         checks = []
-        if doc_type == "PART":
+        reused = False
+        if reuse_deep_checks and identity_match and self._stamp_matches(job, state):
+            # SPEED task C: the deep checks were already run against THIS state_version and
+            # THIS document, and nothing has advanced since (the caller proved that by the
+            # counter). Re-issuing the same analyze calls cannot yield a different answer, so
+            # reuse them instead of paying for another geometry walk.
+            stamp = job["verification_stamp"]
+            checks = stamp.get("deep_checks") or []
+            reused = True
+        elif doc_type == "PART":
             checks = [
                 backend.call("analyze_model", {"analysis_type": "geometry"}),
                 backend.call(
@@ -2200,15 +3937,32 @@ class CadOrchestrator:
             "available": True,
             "identity_match": identity_match,
         }
+        if reused:
+            # Tells a caller (and a test) that these checks came from the stamp, not the wire.
+            result["deep_checks_reused"] = True
         if identity_error:
             result["identity_error"] = identity_error
+        if result["all_completed"]:
+            # Refresh the stamp from THIS verification, so the next finish_job can reuse it.
+            # A non-passing verification deliberately clears it: never let a stale pass survive.
+            job["verification_stamp"] = self._verification_stamp(state, result)
+        else:
+            job.pop("verification_stamp", None)
+        job_store.save(job)
         return state, result
 
-    def finish_job(self, job_id, job_token):
+    def finish_job(self, job_id, job_token, keep_open=False, view_review_json="",
+                   require_view_review=False):
+        """require_view_review: the DSH tool sets it — a part this job built must come with the
+        planner's per-view comparison against the drawing (findings M6)."""
         with self._write_lock:
             job = self._load_job(
                 job_id, job_token, allow_closed_target=True
             )
+            self._require_no_pending_feature_graph(job, "finish_job")
+            if require_view_review and job.get("document_origin") == ORIGIN_CREATED                     and job.get("built_feature_types"):
+                job["view_review"] = check_view_review(view_review_json)
+                job_store.save(job)
             if job.get("target_closed"):
                 state = {}
                 verification = {
@@ -2219,8 +3973,23 @@ class CadOrchestrator:
                     "target_closed": True,
                     "closed_document": job.get("closed_document") or {},
                 }
+                # Its document was already closed by an explicit close step: nothing left to
+                # close, and the job's own record says which document that was.
+                close_report = {
+                    "closed_document": job.get("closed_document") or {},
+                    "document_left_open": None,
+                }
             else:
-                state, verification = self._post_verify(job)
+                close_report = None
+                # SPEED task C / (#6): finish_job used to pay for the cheap counter GET and then
+                # _post_verify read the state again. _post_verify's own read now carries the
+                # authoritative state_version AND the identity, and _stamp_matches() compares
+                # both — strictly stronger than the counter alone (a document switch does not
+                # bump the counter). So the separate probe is a duplicated read: ask for reuse
+                # whenever a stamp exists and let that comparison decide.
+                state, verification = self._post_verify(
+                    job, reuse_deep_checks=bool(job.get("verification_stamp"))
+                )
             if not verification.get("all_completed"):
                 error = {
                     "code": "FINAL_VERIFICATION_FAILED",
@@ -2229,6 +3998,16 @@ class CadOrchestrator:
                         "verification did not pass."
                     ),
                 }
+                if job.get("last_graph_plan_summary") or any(
+                    step.get("kind") == "feature_graph" for step in (job.get("completed_steps") or [])
+                ):
+                    verification["diagnostic_attribution"] = build_diagnostic_attribution(
+                        planned_summary=job.get("last_graph_plan_summary"),
+                        verification=verification,
+                        plan_check=job.get("plan_check"),
+                        error=error,
+                        built_feature_types=job.get("built_feature_types"),
+                    )
                 self._record_failure(
                     job,
                     kind="finish_job",
@@ -2254,13 +4033,68 @@ class CadOrchestrator:
                     error=error,
                     **self._job_metadata(job),
                 )
+            finish_warnings = self._completeness_warnings(job, state)
             job["status"] = "completed"
             job["finished_at"] = utc_now()
             job["execution_status"] = "completed"
             job["verification_status"] = "passed"
             job["recovery_status"] = "not_needed"
-            job["trust_level"] = "verified"
+            gaps = self._verification_gaps(job, finish_warnings)
+            job["trust_level"] = "built_unverified" if gaps else "verified"
+            job["verification_gaps"] = gaps
             job["error"] = None
+            if close_report is None:
+                # Memory hygiene, AFTER the verdict exists: SolidWorks holds every open
+                # document in this one process, so a finished job's own saved document gets
+                # closed. Ordinary cleanup failures preserve the verdict (STANDING RULE);
+                # target identity drift instead invalidates verification below.
+                close_report = self._autoclose_job_document(
+                    job, state, bool(keep_open)
+                )
+            if (close_report.get("close_error") or {}).get("code") == "ACTIVE_DOCUMENT_CHANGED":
+                # A changed target invalidates the verdict, rather than merely failing cleanup.
+                error = close_report["close_error"]
+                verification = {**verification, "all_completed": False, "identity_match": False}
+                job["status"] = "active"
+                job.pop("finished_at", None)
+                job.pop("verification_stamp", None)
+                self._record_failure(
+                    job, kind="finish_job", phase="verification", error=error,
+                    execution_status="completed", verification_status_value="failed",
+                    recovery_status="recovery_unverified",
+                )
+                return envelope(
+                    status="verification_failed", job_id=job_id,
+                    target_document=self._target(state), partial_state=state,
+                    verification=verification, error=error, **close_report,
+                    **self._job_metadata(job),
+                )
+            close_fields = {
+                "closed_document": close_report.get("closed_document"),
+                "document_left_open": close_report.get("document_left_open"),
+            }
+            if close_report.get("close_error"):
+                close_fields["close_error"] = close_report["close_error"]
+            if finish_warnings:
+                close_fields["warnings"] = finish_warnings
+            if job.get("last_graph_plan_summary") or any(
+                step.get("kind") == "feature_graph" for step in (job.get("completed_steps") or [])
+            ):
+                finish_attribution = build_diagnostic_attribution(
+                    planned_summary=job.get("last_graph_plan_summary"),
+                    verification=verification,
+                    plan_check=job.get("plan_check"),
+                    warnings=list(job.get("last_compiler_warnings") or []) + list(finish_warnings),
+                    built_feature_types=job.get("built_feature_types"),
+                )
+                verification["diagnostic_attribution"] = finish_attribution
+                close_fields["diagnostic_attribution"] = finish_attribution
+            if gaps:
+                close_fields["verification_gaps"] = gaps
+                close_fields["trust_note"] = (
+                    "trust_level=built_unverified：零件已建成，但这些项没有客观核实：%s。最终回复如实列出，"
+                    "不要说「已验证」。LEDGER_ABSENT 指特征图没有带可测的 dimension_ledger，只比对了包络和"
+                    "体积；它本身不是重建的理由。" % "、".join(gaps))
             job_store.save(job)
             return envelope(
                 status="completed",
@@ -2269,6 +4103,7 @@ class CadOrchestrator:
                 completed_steps=job.get("completed_steps") or [],
                 partial_state=state,
                 verification=verification,
+                **close_fields,
                 **self._job_metadata(job),
             )
 

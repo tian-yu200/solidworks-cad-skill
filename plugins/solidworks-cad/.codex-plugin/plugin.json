@@ -1,7 +1,7 @@
 {
   "name": "solidworks-cad",
-  "version": "1.1.0",
-  "description": "Reconstruct and validate SolidWorks 3D models from orthographic, sectional, and pictorial drawings through a bundled nine-tool MCP stack.",
+  "version": "2.0.0",
+  "description": "Reconstruct and validate SolidWorks 3D models from orthographic, sectional, pictorial, and PDF drawings through a bundled twelve-tool MCP stack and skill reference resources.",
   "author": {
     "name": "tian-yu200",
     "url": "https://github.com/tian-yu200"
@@ -14,14 +14,15 @@
     "cad",
     "mcp",
     "engineering-drawing",
-    "three-view"
+    "three-view",
+    "feature-graph"
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "SolidWorks 工程图三维建模",
-    "shortDescription": "从三视图、剖视图和立体图重建 SolidWorks 模型",
-    "longDescription": "分析工程图投影关系和剖切结构，生成 PLAN.md，调用随包九工具 SolidWorks MCP 完成参数化建模，并从多个方向验证结果。",
+    "shortDescription": "从三视图、剖视图、立体图与 PDF 工程图重建并核验 SolidWorks 模型",
+    "longDescription": "基于十二工具 SolidWorks MCP 栈与 7 份只读 MCP 参考文档，支持原图直读、局部裁图放大、可选 OCR、中文 10 秒核对单、Feature Graph 参数化建模、尺寸台账比对与多视角渲染复核。",
     "developerName": "tian-yu200",
     "category": "Developer Tools",
     "capabilities": [
@@ -36,4 +37,3 @@
     ]
   }
 }
-

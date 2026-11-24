@@ -19,9 +19,67 @@ preceding sketch, path = an earlier sketch node by id), linear_pattern (canonica
 flip; single direction — the tool's D2 is unwired in C#), ellipse/spline profile primitives,
 graph-level `material` (part graphs only, applied after the last node), edge_flange SIMPLE
 length mode (length XOR frame+profile).
+v0.8 (capability batch 4) adds `shell` — hollow an EXISTING body (a body_producer node) to a
+uniform wall, leaving zero or more faces open. The open faces are FACE anchors on the body being
+consumed, the same pre-consumption anchor rule fillet/chamfer use for edges.
 Anything outside the covered set is rejected here with an explicit 'unsupported' message —
 never silently ignored (recipe.md C5).
+
+Contour closure (v0.7.3) is also plan-time: a sketch consumed by an extrude/revolve/
+sheet_metal base flange/sweep PROFILE/loft profile must CLOSE. The lowering welds chain
+endpoints within CONTOUR_WELD_TOL, so anything still open here is a real coordinate error —
+reported with the exact gap before any execution call, instead of surfacing mid-build as an
+EXTRUSION_FAILED with rollback (the 阀体 2026-08-17 failure class). rib/sketched_bend and
+sweep-path sketches are open by design and never checked.
 """
+
+import math
+import re
+import traceback
+
+from . import contours
+from . import thread_table
+
+
+def frame_error(frame):
+    """A rigid sketch frame has finite origin and orthonormal unit axes."""
+    if (not isinstance(frame, dict)
+            or not all(isinstance(frame.get(k), (list, tuple)) and len(frame[k]) == 3
+                       and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               and math.isfinite(v) for v in frame[k])
+                       for k in ("origin", "xdir", "ydir"))):
+        return "frame requires finite origin/xdir/ydir vectors of length 3"
+    x, y = frame["xdir"], frame["ydir"]
+    if (abs(sum(v*v for v in x)-1) > 1e-6
+            or abs(sum(v*v for v in y)-1) > 1e-6
+            or abs(sum(a*b for a, b in zip(x, y))) > 1e-6):
+        return "frame xdir/ydir must be orthogonal unit vectors"
+    return None
+
+
+def canonical_sketch_frame(ref):
+    """Declared coordinates for a datum sketch; never infer them from a chosen face."""
+    if ref.get("face") is not None:
+        return None
+    d = float(ref.get("offset") or 0)
+    origin, x, y = {
+        "front": ([0, 0, d], [1, 0, 0], [0, 1, 0]),
+        "top": ([0, d, 0], [1, 0, 0], [0, 0, -1]),
+        "right": ([d, 0, 0], [0, 0, -1], [0, 1, 0]),
+    }[ref.get("datum", "top")]
+    return {"origin": origin, "xdir": x, "ydir": y}
+
+# schema_version was required by the contract but never checked, so a graph written for another
+# version went on to fail as a confusing parameter error (review 2026-11-12, F-07). Every draft up
+# to the current one is accepted as before; anything else is rejected before execution.
+CURRENT_SCHEMA_VERSION = "0.8.0-draft"
+_SCHEMA_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)-draft(?:-ir-exp)?$")
+
+
+def supported_schema_version(version):
+    match = _SCHEMA_VERSION.match(version) if isinstance(version, str) else None
+    return bool(match) and tuple(int(g) for g in match.groups()) <= (0, 8, 0)
+
 
 DATUMS = frozenset(("front", "top", "right"))
 # Assembly sub-vocabulary (v0.6.0 — Phase B, ADR-047): component + mate. An assembly graph is
@@ -37,14 +95,16 @@ ANCHOR_KINDS_FACE = frozenset(("plane", "cylinder", "cone", "sphere"))
 ANCHOR_KINDS_EDGE = frozenset(("line", "circle"))
 ANCHOR_KINDS = ANCHOR_KINDS_FACE | ANCHOR_KINDS_EDGE
 NODE_TYPES = frozenset(("box", "sketch", "extrude", "revolve", "sweep", "rib", "hole", "fillet",
-                        "chamfer", "loft", "linear_pattern", "circular_pattern", "sheet_metal",
-                        "sketched_bend", "mirror", "edge_flange")) \
+                        "chamfer", "shell", "loft", "linear_pattern", "circular_pattern",
+                        "sheet_metal", "sketched_bend", "mirror", "edge_flange",
+                        "cosmetic_thread")) \
     | ASSEMBLY_NODE_TYPES
-PROFILE_KINDS = frozenset(("rectangle", "circle", "line", "arc", "ellipse", "spline"))
+PROFILE_KINDS = frozenset(("rectangle", "circle", "line", "arc", "ellipse", "spline", "fillet",
+                           "slot", "rounded_rect"))
 # Optional boolean flags any profile primitive may carry (mirrors analyze_model's per-segment flag).
 PROFILE_FLAGS = frozenset(("construction",))
 FACE_SELECTORS = frozenset(("top",))          # v0.5: only 'top'
-POSITIONS = frozenset(("center",))            # v0.5: only 'center'
+POSITIONS = frozenset(("center", "point"))       # 'point' + ref.at: batch 10a off-centre holes
 THROUGH_DEPTHS = frozenset(("through_all", "through"))
 EXTRUDE_ENDS = frozenset(("blind", "through_all", "up_to_surface", "mid_plane"))
 # Canonical model axes for linear_pattern's direction (the tool selects the default plane whose
@@ -55,34 +115,378 @@ BODY_PRODUCERS = frozenset(("box", "extrude", "revolve", "sweep"))  # node types
 # (the compiler substitutes the seed's runtime-created feature name). Patterns themselves are
 # producers too: a grid composes as a pattern OF a pattern (the D2-less linear tool).
 FEATURE_PRODUCERS = frozenset(("box", "extrude", "revolve", "sweep", "rib", "hole", "fillet", "chamfer",
-                               "loft", "linear_pattern", "circular_pattern", "sheet_metal",
-                               "sketched_bend", "mirror", "edge_flange"))
+                               "shell", "loft", "linear_pattern", "circular_pattern", "sheet_metal",
+                               "sketched_bend", "mirror", "edge_flange", "cosmetic_thread"))
 CHAMFER_TYPES = frozenset(("distance_angle", "distance_distance"))
+# --- Threads (v0.9.0) ---------------------------------------------------------------------
+# The COSMETIC representation is the only one wired end to end: it is an annotation the drawing
+# reads and it changes no topology, so it is the safe default. 'real' and 'auto' are RESERVED
+# vocabulary — accepted by the schema (so a graph can record the intent) and REJECTED by
+# validation with an explicit message, because the real (cut) Thread path needs a Metric
+# Tap.SLDLFP profile library, a different selection mark (1, not 0) and a different end-condition
+# enum. Rejecting is the module's C5 rule: never silently ignore, never silently substitute.
+THREAD_REPRESENTATIONS = frozenset(("cosmetic", "real", "auto"))
+THREAD_REPRESENTATION_IMPLEMENTED = frozenset(("cosmetic",))
+THREAD_SERIES = frozenset(("ISO_metric",))
+# ISO 965-1 internal tolerance classes: grades 4-8 in positions G (loose) and H (basic).
+THREAD_CLASSES = frozenset(("4H", "5H", "6H", "7H", "8H", "4G", "5G", "6G", "7G", "8G"))
+# Drawing-standard family -> the swCosmeticStandardType_e enum the tool takes. Only the metric
+# internal families are offered: an inch/pipe standard would need its own Size strings AND its
+# own tap-drill data, and the reference repo's roadmap explicitly refuses to reuse Metric Tap.
+THREAD_STANDARDS = frozenset(("ISO", "GB", "DIN", "JIS"))
+THREAD_STANDARD_ENUM = {"ISO": 8, "GB": 13, "DIN": 4, "JIS": 9}
+THREAD_HANDEDNESS = frozenset(("right", "left"))
+# Node types whose geometry can carry a cosmetic thread (a bore, i.e. an internal cylinder):
+# a drilled hole, or a revolve/sweep/extrude CUT. Deliberately NOT box/rib/loft: those produce
+# no bore the thread could sit on, and accepting them would let a graph validate and then fail
+# at resolve time with a confusing REFERENCE_UNRESOLVED.
+THREADABLE_PRODUCERS = frozenset(("hole", "extrude", "revolve", "sweep"))
 BEND_POSITIONS = frozenset(("centerline", "material_inside", "material_outside", "bend_outside"))
 # Edge flange adds 'bend_sharp' (swFlangePositionTypes_e 5) to the shared position set.
 EDGE_FLANGE_POSITIONS = BEND_POSITIONS | frozenset(("bend_sharp",))
 
 
 def _is_pos_number(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+    # isfinite as well as > 0: +inf satisfies `v > 0`, so it must be excluded explicitly.
+    # Only FLOATS can be non-finite: an int is always finite, and math.isfinite() on an int
+    # beyond float range (10**400 — json.loads happily produces those) raises OverflowError
+    # instead of answering, so a plain int must never be handed to it.
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and (not isinstance(v, float) or math.isfinite(v)) and v > 0)
 
 
 def _is_number(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    # isfinite rejects NaN and +/-Inf: JSON allows them only as non-standard literals (Python's
+    # json.loads ACCEPTS NaN/Infinity/-Infinity by default), and an infinite coordinate would be
+    # emitted verbatim into the execution layer's params. NaN is worse than inf: every comparison
+    # against it is False, so a NaN endpoint silently counts as "paired" in the closure walk.
+    # Ints are always finite and NEVER go through math.isfinite (a huge int raises
+    # OverflowError there) — only floats can be NaN/Inf.
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and (not isinstance(v, float) or math.isfinite(v)))
 
 
 def _is_point3(v):
     return isinstance(v, list) and len(v) == 3 and all(_is_number(c) for c in v)
 
 
+def _normalize_class(value):
+    """The canonical tolerance class, or None when it is not a known INTERNAL class.
+
+    Only the exact uppercase spelling is accepted. Lowercase is NOT a case variant here: ISO 965
+    writes internal thread classes in UPPERCASE (6H) and EXTERNAL ones in lowercase (6g, 6h).
+    Upper-casing first (as this function used to) turned an external `6h` into the internal `6H`
+    and silently accepted a graph that asked for something v1 cannot build — the callout then
+    claimed an internal tolerance on a hole nobody had validated. So lowercase is rejected, and
+    the caller's message explains why (see _class_error).
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if text in THREAD_CLASSES else None
+
+
+def _class_error(value):
+    """The message for a rejected `class`, distinguishing an EXTERNAL class from a typo.
+    Returns None when `value` is a valid internal class (nothing to report).
+    """
+    if _normalize_class(value) is not None:
+        return None
+    text = value.strip() if isinstance(value, str) else value
+    if isinstance(text, str) and text.lower() in {c.lower() for c in THREAD_CLASSES}:
+        # Right number, wrong case: that is an EXTERNAL thread class (ISO 965-1 writes internal
+        # classes uppercase, external ones lowercase).
+        return ("%r is an EXTERNAL thread tolerance class (ISO 965-1 writes external "
+                "classes in lowercase: 6g, 6h). v1 supports INTERNAL threads only — pass the "
+                "uppercase internal class %r, or omit 'class' to leave it off the callout."
+                % (value, text.upper()))
+    return ("%r is not an ISO 965-1 internal tolerance class (one of %s)."
+            % (value, sorted(THREAD_CLASSES)))
+
+
+def _resolve_thread_size(designation, pitch):
+    """(major_m, pitch_m, tap_drill_m or None, pitch_given) for a designation, in METRES.
+
+    Raises ValueError with a human message on anything unresolvable — the caller turns that
+    into an error string. A bare 'M6' resolves its coarse pitch from the table; an explicit
+    pitch always wins (that is how a fine pitch is declared). `pitch_given` says whether a
+    pitch came from ANYWHERE (the `pitch` field or the designation text), which is what decides
+    between "you must state a pitch" and "you must state a tap_drill" for an out-of-table size.
+    """
+    major_mm, parsed_pitch, _canonical = thread_table.parse_designation(designation)
+    effective = pitch if pitch is not None else parsed_pitch
+    pitch_mm = thread_table.resolve_pitch(major_mm, effective)
+    return (major_mm / 1000.0, pitch_mm / 1000.0,
+            thread_table.tap_drill_m(major_mm, pitch_mm), effective is not None)
+
+
+def _check_thread_block(block, label, errors, declared_pilot=None, declared_pilot_depth=None,
+                        where="thread"):
+    """Shared validation for a thread declaration (hole.thread / a cosmetic_thread node).
+
+    `declared_pilot` (metres) is the hole's `diameter` when the block lives on a hole; for a
+    standalone cosmetic_thread node there is no pilot to cross-check, so pass None and only the
+    table-independent rules run. Returns the resolved (major_m, pitch_m) or None when the block
+    could not be resolved — the caller must not use it then.
+    """
+    if not isinstance(block, dict):
+        errors.append("%s: '%s' must be an object." % (label, where))
+        return None
+
+    desig = block.get("designation")
+    if not isinstance(desig, str) or not desig.strip():
+        errors.append("%s.%s: 'designation' is required — an ISO metric size like 'M6' or "
+                      "'M42x2'." % (label, where))
+        return None
+
+    series = block.get("series")
+    if series is not None and series not in THREAD_SERIES:
+        errors.append("%s.%s: 'series' %r unsupported (only %s in v1 — no UNC/UNF/NPT/BSP; "
+                      "an inch or pipe thread must not reuse the metric Size table)."
+                      % (label, where, series, sorted(THREAD_SERIES)))
+
+    standard = block.get("standard")
+    if standard is not None and standard not in THREAD_STANDARDS:
+        errors.append("%s.%s: 'standard' %r unsupported (only %s; each maps to a "
+                      "swCosmeticStandardType_e member)."
+                      % (label, where, standard, sorted(THREAD_STANDARDS)))
+
+    representation = block.get("representation")
+    if representation is not None:
+        if representation not in THREAD_REPRESENTATIONS:
+            errors.append("%s.%s: 'representation' %r unsupported (only %s)."
+                          % (label, where, representation, sorted(THREAD_REPRESENTATIONS)))
+        elif representation not in THREAD_REPRESENTATION_IMPLEMENTED:
+            errors.append("%s.%s: representation '%s' is RESERVED, not implemented — v1 wires "
+                          "only 'cosmetic' (an annotation the drawing reads, zero topology "
+                          "change). A real (cut) thread needs the Metric Tap.SLDLFP profile "
+                          "library, selection mark 1 and swThreadEndCondition_e; write "
+                          "representation 'cosmetic' or omit it (the default)."
+                          % (label, where, representation))
+
+    handedness = block.get("handedness")
+    if handedness is not None and handedness not in THREAD_HANDEDNESS:
+        errors.append("%s.%s: 'handedness' %r unsupported (only %s)."
+                      % (label, where, handedness, sorted(THREAD_HANDEDNESS)))
+
+    thread_class = block.get("class")
+    if thread_class is not None and _normalize_class(thread_class) is None:
+        errors.append("%s.%s: %s" % (label, where, _class_error(thread_class)))
+
+    if block.get("internal") is False:
+        errors.append("%s.%s: external threads ('internal': false) are NOT supported in v1 — "
+                      "InsertCosmeticThread3's DiameterType for a boss is the MINOR diameter "
+                      "and the whole tap-drill cross-check inverts. Remove 'internal' or set it "
+                      "true." % (label, where))
+
+    if block.get("callout") is not None and not isinstance(block.get("callout"), str):
+        errors.append("%s.%s: 'callout' must be a string when present." % (label, where))
+    if block.get("callout_style") is not None and block.get("callout_style") not in thread_table.CALLOUT_STYLES:
+        errors.append("%s.%s: 'callout_style' %r unsupported (only %s)."
+                      % (label, where, block.get("callout_style"),
+                         sorted(thread_table.CALLOUT_STYLES)))
+
+    # depth: 'through_all' or a finite positive length. Absent means "follow the hole" — but
+    # only for a THROUGH hole, where the thread is through as well. A blind hole with a thread
+    # and no thread depth is ambiguous (does the thread stop at the floor or 2 mm above it?),
+    # and the drawing always states it, so demand it rather than guessing.
+    depth = block.get("depth")
+    if depth is not None and depth not in THROUGH_DEPTHS and not _is_pos_number(depth):
+        errors.append("%s.%s: 'depth' must be a positive number of meters (blind thread length) "
+                      "or 'through_all' (got %r)." % (label, where, depth))
+    elif depth is None and _is_pos_number(declared_pilot_depth):
+        errors.append("%s.%s: 'depth' is required for a thread in a BLIND hole (the pilot is "
+                      "%s mm deep) — state the thread depth in meters, or 'through_all' if the "
+                      "thread runs the whole pilot."
+                      % (label, where, thread_table.format_mm(float(declared_pilot_depth))))
+
+    # --- resolve the size -------------------------------------------------------------
+    pitch = block.get("pitch")
+    if pitch is not None and not _is_pos_number(pitch):
+        errors.append("%s.%s: 'pitch' must be a positive number of meters (e.g. 0.002 for 2 mm)."
+                      % (label, where))
+        return None
+    try:
+        major_m, pitch_m, tap_m, pitch_given = _resolve_thread_size(desig, pitch)
+    except ValueError as ex:
+        errors.append("%s.%s: %s" % (label, where, ex))
+        return None
+
+    nominal = block.get("nominal")
+    if nominal is not None and not _is_pos_number(nominal):
+        errors.append("%s.%s: 'nominal' must be a positive number of meters (the MAJOR "
+                      "diameter the cosmetic thread is drawn on)." % (label, where))
+    elif nominal is not None and abs(float(nominal) - major_m) > 1e-6:
+        errors.append("%s.%s: 'nominal' %g mm contradicts the designation %r (%g mm) — the "
+                      "cosmetic thread's Diameter is the NOMINAL MAJOR diameter."
+                      % (label, where, float(nominal) * 1000.0, desig, major_m * 1000.0))
+
+    # --- the tap-drill rule: the whole reason thread_table.py exists -------------------
+    explicit_pilot = block.get("tap_drill")
+    if explicit_pilot is not None and not _is_pos_number(explicit_pilot):
+        errors.append("%s.%s: 'tap_drill' must be a positive number of meters." % (label, where))
+        explicit_pilot = None
+
+    if tap_m is None and not pitch_given:
+        errors.append("%s.%s: %r is not in the ISO metric tap-drill table and no 'pitch' was "
+                      "given — an out-of-table size needs BOTH an explicit 'pitch' and an "
+                      "explicit 'tap_drill' (the pilot cannot be guessed; D-P is not the "
+                      "standard drill)." % (label, where, desig))
+        return major_m, pitch_m
+    if tap_m is None and explicit_pilot is None:
+        errors.append("%s.%s: M%gx%g is not in the tap-drill table — give 'tap_drill' "
+                      "explicitly (meters). The table covers the ISO first-choice coarse and "
+                      "fine series; anything else must state its pilot."
+                      % (label, where, major_m * 1000.0, pitch_m * 1000.0))
+        return major_m, pitch_m
+
+    if declared_pilot is not None:
+        if tap_m is not None:
+            delta = abs(float(declared_pilot) - tap_m)
+            if delta > thread_table.PILOT_TOL_M:
+                errors.append("%s: PILOT_MISMATCH — diameter is %s mm but %r taps at %s mm "
+                              "(table, ISO 261/965-1; off by %s mm > %g mm). Either correct "
+                              "'diameter' or state an explicit 'tap_drill' if this is a "
+                              "form-tapped or non-standard pilot."
+                              % (label, thread_table.format_dia_mm(float(declared_pilot)), desig,
+                                 thread_table.format_dia_mm(tap_m),
+                                 thread_table.format_dia_mm(delta),
+                                 thread_table.PILOT_TOL_M * 1000.0))
+        elif explicit_pilot is not None:
+            delta = abs(float(declared_pilot) - float(explicit_pilot))
+            if delta > thread_table.PILOT_TOL_EXPLICIT_M:
+                errors.append("%s: PILOT_MISMATCH — diameter is %s mm but 'tap_drill' is %s mm "
+                              "(off by %s mm > %g mm)."
+                              % (label, thread_table.format_dia_mm(float(declared_pilot)),
+                                 thread_table.format_dia_mm(float(explicit_pilot)),
+                                 thread_table.format_dia_mm(delta),
+                                 thread_table.PILOT_TOL_EXPLICIT_M * 1000.0))
+        # The floor the reference repo enforces: a pilot at or above the major is not a thread.
+        if float(declared_pilot) >= major_m:
+            errors.append("%s: diameter %s mm is not smaller than the %r major diameter %s mm — "
+                          "a tapped hole is drilled UNDER the nominal size."
+                          % (label, thread_table.format_dia_mm(float(declared_pilot)), desig,
+                             thread_table.format_dia_mm(major_m)))
+
+    # Thread depth must fit inside the pilot: a thread cannot be longer than the hole.
+    if declared_pilot_depth is not None and _is_pos_number(declared_pilot_depth):
+        if depth is not None and depth not in THROUGH_DEPTHS:
+            if float(depth) > float(declared_pilot_depth) + 1e-9:
+                errors.append("%s.%s: thread 'depth' %s mm exceeds the pilot depth %s mm — the "
+                              "thread cannot run past the bottom of the hole."
+                              % (label, where, thread_table.format_mm(float(depth)),
+                                 thread_table.format_mm(float(declared_pilot_depth))))
+
+    # Engagement sanity: 75-85 % is the chart's band; outside 70-90 % is accepted with the
+    # table's warning only when the pilot was stated explicitly (a form tap legitimately runs
+    # a larger pilot). The hard numbers are checked above; this is a documented non-error.
+    return major_m, pitch_m
+
+
+EXPECT_KEYS = ("bbox_mm", "volume_mm3", "features")
+
+
+def _planned_feature_counts(nodes):
+    """How many of each feature the graph makes, as a plan counts them.
+
+    A plan says "four R10 fillets" for one fillet node with four edges, or for four corners rounded
+    by sketch `fillet` primitives; counting nodes only rejected both (zct01 and t101 on 2026-11-09:
+    "fillet = 4 but the graph has 1 fillet node"). Fillets and chamfers count the larger of their
+    node and edge-anchor totals, and fillets also count sketch fillet primitives."""
+    counts, edges, sketch_fillets = {}, {}, 0
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("type"), str):
+            continue
+        kind = node["type"]
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind in ("fillet", "chamfer") and isinstance(node.get("edges"), list):
+            edges[kind] = edges.get(kind, 0) + len(node["edges"])
+        if kind == "sketch" and isinstance(node.get("profile"), list):
+            sketch_fillets += sum(1 for p in node["profile"] if isinstance(p, dict) and p.get("kind") == "fillet")
+    for kind, n in edges.items():
+        counts[kind] = max(counts.get(kind, 0), n)
+    if sketch_fillets:
+        counts["fillet"] = counts.get("fillet", 0) + sketch_fillets
+    return counts
+
+
+def _check_expect(expect, nodes, errors):
+    """Graph-level `expect`: what the approved plan says the part will be, checked against the
+    build. Never lowered: the compiler builds nodes only; the DSH orchestrator compares the
+    readback envelope and volume after the build (2026-11-02, 脚踏座: a plan of 90×80×117 was
+    built as 60×90×103 and reported verified). Millimetres on purpose, as the plan states them.
+
+    The `features` minimums are checked HERE, before anything runs: a plan with an R3 fillet
+    whose graph has no fillet node is caught at no cost (10-31 and 11-02 both dropped one).
+    """
+    if expect is None:
+        return
+    if not isinstance(expect, dict) or not expect:
+        errors.append("graph.expect must be an object {bbox_mm, volume_mm3?, features?} when present.")
+        return
+    for key in sorted(expect):
+        if key not in EXPECT_KEYS:
+            errors.append("graph.expect.%s is not a plan check (allowed: %s)." % (key, ", ".join(EXPECT_KEYS)))
+    bbox = expect.get("bbox_mm")
+    if bbox is not None:
+        if not isinstance(bbox, list) or len(bbox) != 3 or not all(_is_pos_number(v) for v in bbox):
+            errors.append("graph.expect.bbox_mm must be the plan's overall envelope as three positive "
+                          "numbers in millimetres, any axis order (got %r)." % (bbox,))
+        elif max(bbox) < 1:
+            errors.append("graph.expect.bbox_mm is in MILLIMETRES (got %r — that reads as metres; "
+                          "write e.g. [90, 93, 157])." % (bbox,))
+    volume = expect.get("volume_mm3")
+    if volume is not None and not _is_pos_number(volume):
+        errors.append("graph.expect.volume_mm3 must be a positive number of cubic millimetres "
+                      "(leave it out when the plan has no volume).")
+    features = expect.get("features")
+    if features is None:
+        return
+    if not isinstance(features, dict):
+        errors.append("graph.expect.features must be {node type: count}, e.g. {\"fillet\": 1, "
+                      "\"chamfer\": 1}.")
+        return
+    counts = _planned_feature_counts(nodes)
+    for kind in sorted(features):
+        want = features[kind]
+        if kind not in NODE_TYPES or kind == "sketch":
+            errors.append("graph.expect.features.%s is not a feature node type." % kind)
+        elif isinstance(want, bool) or not isinstance(want, int) or want < 0:
+            # 0 is how a plan says "none of these"; it checks nothing. Rejecting it cost 8 of the
+            # first 10 bench runs a wasted submit (2026-11-08, findings H1).
+            errors.append("graph.expect.features.%s must be a whole count (0 = none)." % kind)
+        elif counts.get(kind, 0) < want:
+            errors.append("graph.expect.features.%s = %d but the graph makes %d %s(s): the approved "
+                          "plan has it — add the node(s), do not drop them from expect."
+                          % (kind, want, counts.get(kind, 0), kind))
+
+
 def validate(graph):
-    """Return a list of human-readable error strings ([] == structurally valid)."""
+    """Return a list of human-readable error strings ([] == structurally valid).
+
+    Never raises. A value of the wrong JSON type where a name belongs (e.g. a pattern
+    `direction` written as {"datum": "right"}) used to crash the checks below with
+    "unhashable type" instead of telling the planner which field was wrong (2026-11-09)."""
+    try:
+        return _validate(graph)
+    except (TypeError, AttributeError, KeyError, ValueError) as ex:
+        frame = traceback.extract_tb(ex.__traceback__)[-1]
+        return ["graph has a value of the wrong JSON type (%s: %s). The check that hit it: `%s`. "
+                "Enum-like fields (direction, end, operation, kind, datum, selector) take a plain "
+                "string; numbers take numbers; lists only where the schema shows a list."
+                % (type(ex).__name__, ex, (frame.line or "").strip())]
+
+
+def _validate(graph):
     errors = []
     if not isinstance(graph, dict):
         return ["graph must be a JSON object."]
 
     if graph.get("units") != "meters":
         errors.append("units must be 'meters' (got %r)." % graph.get("units"))
+    if not supported_schema_version(graph.get("schema_version")):
+        errors.append("schema_version %r is not a version this compiler implements: write %r."
+                      % (graph.get("schema_version"), CURRENT_SCHEMA_VERSION))
 
     nodes = graph.get("nodes")
     if not isinstance(nodes, list) or len(nodes) == 0:
@@ -111,6 +515,56 @@ def validate(graph):
         if "assembly" in kinds:
             errors.append("graph.material is PART-only — set_part_material requires a part "
                           "document, not an assembly.")
+
+    _check_expect(graph.get("expect"), nodes, errors)
+
+    # Graph-level thread defaults (v0.9.0): DOCUMENT state, exactly like `material` — a drawing
+    # whose holes are all ISO 6H should not repeat that on every node. Node-level fields win;
+    # these only fill what a node leaves out. Prose keys are the vocabulary the node fields use,
+    # so a bad default is caught here rather than silently propagating into every node.
+    thread_defaults = graph.get("thread_defaults")
+    if thread_defaults is not None:
+        if not isinstance(thread_defaults, dict):
+            errors.append("graph.thread_defaults must be an object "
+                          "{series?, standard?, class?, handedness?, representation?, "
+                          "callout_style?} when present.")
+        else:
+            if "assembly" in kinds:
+                errors.append("graph.thread_defaults is PART-only — a cosmetic thread is a "
+                              "feature of a part document, not of an assembly.")
+            allowed = ("series", "standard", "class", "handedness", "representation",
+                       "callout_style")
+            for key in sorted(thread_defaults):
+                if key not in allowed:
+                    errors.append("graph.thread_defaults.%s is not a thread default (allowed: %s)."
+                                  % (key, ", ".join(allowed)))
+            series = thread_defaults.get("series")
+            if series is not None and series not in THREAD_SERIES:
+                errors.append("graph.thread_defaults.series %r unsupported (only %s)."
+                              % (series, sorted(THREAD_SERIES)))
+            standard = thread_defaults.get("standard")
+            if standard is not None and standard not in THREAD_STANDARDS:
+                errors.append("graph.thread_defaults.standard %r unsupported (only %s)."
+                              % (standard, sorted(THREAD_STANDARDS)))
+            default_class = thread_defaults.get("class")
+            if default_class is not None and _normalize_class(default_class) is None:
+                errors.append("graph.thread_defaults.class: %s" % _class_error(default_class))
+            handedness = thread_defaults.get("handedness")
+            if handedness is not None and handedness not in THREAD_HANDEDNESS:
+                errors.append("graph.thread_defaults.handedness %r unsupported (only %s)."
+                              % (handedness, sorted(THREAD_HANDEDNESS)))
+            representation = thread_defaults.get("representation")
+            if representation is not None and representation not in THREAD_REPRESENTATIONS:
+                errors.append("graph.thread_defaults.representation %r unsupported (only %s)."
+                              % (representation, sorted(THREAD_REPRESENTATIONS)))
+            elif representation is not None \
+                    and representation not in THREAD_REPRESENTATION_IMPLEMENTED:
+                errors.append("graph.thread_defaults.representation '%s' is RESERVED, not "
+                              "implemented — v1 wires only 'cosmetic'." % representation)
+            style = thread_defaults.get("callout_style")
+            if style is not None and style not in thread_table.CALLOUT_STYLES:
+                errors.append("graph.thread_defaults.callout_style %r unsupported (only %s)."
+                              % (style, sorted(thread_table.CALLOUT_STYLES)))
 
     seen = {}  # id -> type (in declaration order)
     seen_mate = False
@@ -149,14 +603,17 @@ def validate(graph):
             if not isinstance(profile, list) or len(profile) == 0:
                 errors.append("%s: 'profile' must be a non-empty array of primitives." % label)
             else:
+                before = len(errors)
                 for j, prim in enumerate(profile):
                     _check_profile_prim(prim, "%s.profile[%d]" % (label, j), errors)
+                if len(errors) == before:
+                    errors.extend("%s: %s" % (label, problem)
+                                  for problem in contours.resolve_fillets(profile)[1])
             frame = node.get("frame")
             if frame is not None:
-                if (not isinstance(frame, dict)
-                        or not all(_is_point3(frame.get(k)) for k in ("origin", "xdir", "ydir"))):
-                    errors.append("%s: 'frame' must be {origin:[x,y,z], xdir:[x,y,z], ydir:[x,y,z]} "
-                                  "— the ORIGINAL sketch's frame from analyze_model(sketch)." % label)
+                problem = frame_error(frame)
+                if problem:
+                    errors.append("%s: %s" % (label, problem))
 
         elif ntype == "extrude":
             sk = node.get("sketch")
@@ -184,16 +641,164 @@ def validate(graph):
             elif seen.get(tgt) not in BODY_PRODUCERS:
                 errors.append("%s: ref.node_face.node '%s' must reference an earlier box/extrude node." % (label, tgt))
             if nf.get("selector") not in FACE_SELECTORS:
-                errors.append("%s: ref.node_face.selector %r unsupported in v0.5 (only %s)."
+                # Just renaming the selector to 'top' turns a side bore into a hole on the
+                # upward face (脚踏座 2026-11-02), so say what a side bore is built as.
+                errors.append("%s: ref.node_face.selector %r unsupported (only %s). A hole goes "
+                              "only into a body's upward (+Y) face; for a bore in any other face "
+                              "(front/side/boss end) use a sketch with a circle on that datum "
+                              "plane (signed offset) and an extrude with operation 'cut' — do not "
+                              "just rename the selector."
                               % (label, nf.get("selector"), sorted(FACE_SELECTORS)))
-            if ref.get("position") not in POSITIONS:
-                errors.append("%s: ref.position %r unsupported in v0.5 (only %s)."
-                              % (label, ref.get("position"), sorted(POSITIONS)))
+            # --- placement (batch 10a) — off-centre holes ---------------------------------
+            # `position: 'point'` + `at: [x,y,z]` (MODEL space, metres) puts the hole anywhere on
+            # the referenced face instead of its centre. The 3-D point is mapped into the FACE
+            # SKETCH's own 2-D frame at compile time (after create_sketch echoes the measured
+            # frame), so a face whose sketch x-axis is not model X needs no author guesswork.
+            # Plan-time checks here are structural only; the on-face/inside-face tests run
+            # against the resolved face in the compiler (they need the live plane).
+            position = ref.get("position")
+            if position not in POSITIONS:
+                errors.append("%s: ref.position %r unsupported (only %s)."
+                              % (label, position, sorted(POSITIONS)))
+            at = ref.get("at")
+            if position == "point":
+                if not _is_point3(at):
+                    errors.append("%s: ref.at must be a 3-D point [x, y, z] in METERS when "
+                                  "ref.position is 'point' (got %r)." % (label, at))
+            elif at is not None:
+                errors.append("%s: ref.at is only read when ref.position is 'point' "
+                              "(got position %r)." % (label, position))
             if not _is_pos_number(node.get("diameter")):
                 errors.append("%s: 'diameter' must be a positive number (meters)." % label)
+            # depth is either the through-all token or a BLIND hole depth in metres
+            # (finite, > 0) — the same positive-number rule as 'diameter'.
             depth = node.get("depth")
-            if depth not in THROUGH_DEPTHS:
-                errors.append("%s: 'depth' must be 'through_all' in v0.5 (got %r)." % (label, depth))
+            if depth not in THROUGH_DEPTHS and not _is_pos_number(depth):
+                errors.append("%s: 'depth' must be a positive number of meters (blind hole) or "
+                              "'through_all' (got %r)." % (label, depth))
+
+            # --- counterbore (v0.9.0) — the M6 counterbored holes -------------------------
+            # A coaxial counterbore is cut FIRST by the lowering (see lowering.lower_hole): it
+            # changes the entry face, and cutting it after the pilot would re-intersect the
+            # already-threaded mouth edge, dropping the cosmetic thread (a subfeature of the
+            # cut). `hole.depth` is measured from the COUNTERBORE FLOOR when present, so the
+            # pilot's absolute cut depth is counterbore.depth + hole.depth.
+            counterbore = node.get("counterbore")
+            if counterbore is not None:
+                if not isinstance(counterbore, dict):
+                    errors.append("%s: 'counterbore' must be an object {diameter, depth}." % label)
+                else:
+                    cb_dia = counterbore.get("diameter")
+                    cb_depth = counterbore.get("depth")
+                    if not _is_pos_number(cb_dia):
+                        errors.append("%s.counterbore: 'diameter' must be a positive number "
+                                      "(meters)." % label)
+                    elif _is_pos_number(node.get("diameter")) \
+                            and float(cb_dia) <= float(node["diameter"]):
+                        errors.append("%s.counterbore: 'diameter' %s mm must be LARGER than the "
+                                      "hole diameter %s mm — a counterbore is the wider, "
+                                      "shallower cut at the entry."
+                                      % (label, thread_table.format_dia_mm(float(cb_dia)),
+                                         thread_table.format_dia_mm(float(node["diameter"]))))
+                    if not _is_pos_number(cb_depth):
+                        errors.append("%s.counterbore: 'depth' must be a positive number "
+                                      "(meters)." % label)
+                    elif _is_pos_number(depth) and float(cb_depth) >= float(depth):
+                        errors.append("%s.counterbore: 'depth' %s mm must be SHALLOWER than the "
+                                      "hole depth %s mm (measured from the counterbore floor)."
+                                      % (label, thread_table.format_mm(float(cb_depth)),
+                                         thread_table.format_mm(float(depth))))
+                    for key in sorted(counterbore):
+                        if key not in ("diameter", "depth"):
+                            errors.append("%s.counterbore.%s is not a counterbore field "
+                                          "(allowed: diameter, depth — a spot-face or countersink "
+                                          "is not modelled in v1)." % (label, key))
+
+            # --- thread (v0.9.0) — the M5-8H style tapped hole ---------------------------
+            thread = node.get("thread")
+            if thread is not None:
+                if thread.get("depth") is None and depth in THROUGH_DEPTHS:
+                    # A tapped THROUGH hole needs no thread depth (it is through); a blind one
+                    # does, and _check_thread_block reports it.
+                    pass
+                _check_thread_block(thread, label, errors,
+                                    declared_pilot=node.get("diameter"),
+                                    declared_pilot_depth=depth, where="thread")
+
+        elif ntype == "cosmetic_thread":
+            # A thread on a bore that already exists (v0.9.0) — the M42x2 / M40x2 valve-body
+            # bores come from `revolve` cuts, so there is no `hole` node to hang a `thread`
+            # block on. One node, one op: add_cosmetic_thread on a resolver-matched circular
+            # edge. It consumes NO geometry (a cosmetic thread adds zero faces/edges), so its
+            # ref is resolved against the geometry as it stands — no pre-consumption rule.
+            ref = node.get("ref")
+            if not isinstance(ref, dict):
+                errors.append("%s: 'ref' is required — {node, edge_anchor|bore_face}." % label)
+                ref = {}
+            tgt = ref.get("node")
+            if not isinstance(tgt, str) or not tgt:
+                errors.append("%s: ref.node (an earlier node id) is required — the node that "
+                              "created the bore." % label)
+            elif seen.get(tgt) not in THREADABLE_PRODUCERS:
+                errors.append("%s: ref.node '%s' must be an earlier %s node (a node whose "
+                              "geometry can carry a bore)."
+                              % (label, tgt, "/".join(sorted(THREADABLE_PRODUCERS))))
+            edge_anchor = ref.get("edge_anchor")
+            bore_face = ref.get("bore_face")
+            if edge_anchor is None and bore_face is None:
+                errors.append("%s: exactly ONE of ref.edge_anchor / ref.bore_face is required — "
+                              "the circular edge at the bore mouth (exact, from "
+                              "analyze_model(edges)) or the cylindrical face to derive it from."
+                              % label)
+            elif edge_anchor is not None and bore_face is not None:
+                errors.append("%s: ref.edge_anchor and ref.bore_face are mutually exclusive — "
+                              "give the mouth edge, or the bore face it is derived from." % label)
+            if edge_anchor is not None:
+                if not isinstance(edge_anchor, dict) or not _is_point3(edge_anchor.get("near")):
+                    errors.append("%s: ref.edge_anchor must be {near:[x,y,z], radius?, hint?} — "
+                                  "`near` is the mouth circle's CENTRE (analyze_model(edges) "
+                                  "reports it as `center` for kind='circle'), NOT a point on the "
+                                  "rim and NOT an edge midpoint." % label)
+                else:
+                    # radius is a DISAMBIGUATOR: a bore mouth can be concentric and coplanar with
+                    # an outer rim (a revolve end face) or with a counterbore-floor rim, and only
+                    # the radius tells them apart.
+                    anchor_radius = edge_anchor.get("radius")
+                    if anchor_radius is not None and not _is_pos_number(anchor_radius):
+                        errors.append("%s: ref.edge_anchor.radius must be a positive number of "
+                                      "meters (it separates the mouth from a concentric rim)."
+                                      % label)
+                    if edge_anchor.get("hint") is not None \
+                            and not isinstance(edge_anchor.get("hint"), str):
+                        errors.append("%s: ref.edge_anchor.hint must be a string when present."
+                                      % label)
+                    for key in sorted(edge_anchor):
+                        if key not in ("near", "radius", "hint"):
+                            errors.append("%s: ref.edge_anchor.%s is not an edge-anchor field "
+                                          "(allowed: near, radius, hint)." % (label, key))
+            if bore_face is not None:
+                if not isinstance(bore_face, dict) or not _is_point3(bore_face.get("near")):
+                    errors.append("%s: ref.bore_face must be {near:[x,y,z], radius?, hint?} — "
+                                  "a point ON the bore's cylindrical surface." % label)
+                else:
+                    radius = bore_face.get("radius")
+                    if radius is not None and not _is_pos_number(radius):
+                        errors.append("%s: ref.bore_face.radius must be a positive number of "
+                                      "meters (it pins WHICH coaxial cylinder is meant)."
+                                      % label)
+                    for key in sorted(bore_face):
+                        if key not in ("near", "radius", "hint"):
+                            errors.append("%s: ref.bore_face.%s is not a bore-face field "
+                                          "(allowed: near, radius, hint)." % (label, key))
+            # The thread block IS the node body: designation/depth/class/... live at the top
+            # level, so the same validator serves hole.thread and this node unchanged.
+            _check_thread_block(node, label, errors, where="cosmetic_thread")
+            for key in ("edge_index", "diameter"):
+                if node.get(key) is not None:
+                    errors.append("%s: '%s' is not a cosmetic_thread field — the edge is "
+                                  "resolved from ref (never given as an index in the IR), and "
+                                  "the Diameter is the designation's nominal major."
+                                  % (label, key))
 
         elif ntype == "revolve":
             sk = node.get("sketch")
@@ -203,8 +808,8 @@ def validate(graph):
             elif seen.get(sk) != "sketch":
                 errors.append("%s: 'sketch' must reference an earlier sketch node (got '%s')." % (label, sk))
             elif not (isinstance(prev, dict) and prev.get("id") == sk):
-                # Like extrude: a revolve consumes the ACTIVE sketch (the axis segment is
-                # coordinate-selected, which only works while the sketch is open).
+                # Like extrude: a revolve consumes the ACTIVE sketch (the executor resolves the axis
+                # against the sketch's own segments, which only works while the sketch is open).
                 errors.append("%s: a revolve must immediately follow its sketch node '%s'." % (label, sk))
             axis = node.get("axis")
             if not isinstance(axis, dict) or not all(_is_number(axis.get(k)) for k in ("x1", "y1", "x2", "y2")):
@@ -212,9 +817,23 @@ def validate(graph):
                               "sketch coords (normally the construction centerline)." % label)
             elif axis.get("x1") == axis.get("x2") and axis.get("y1") == axis.get("y2"):
                 errors.append("%s: axis start and end coincide — not a segment." % label)
+            elif isinstance(prev, dict) and prev.get("id") == sk and isinstance(prev.get("profile"), list):
+                sides = contours.axis_sides(prev["profile"], axis)
+                if sides and sides[0][0] < -contours.CONTOUR_WELD_TOL and sides[1][0] > contours.CONTOUR_WELD_TOL:
+                    (low, i), (high, j) = sides
+                    errors.append(
+                        "%s: the profile of sketch '%s' lies on BOTH sides of the revolve axis — "
+                        "profile[%d] reaches %.2f mm on one side and profile[%d] %.2f mm on the other. "
+                        "SolidWorks revolves only a profile on one side of its axis (it may touch it): "
+                        "draw the half-section only; a bore is the half-section's inner edge, not a "
+                        "second half." % (label, sk, i, -low * 1000, j, high * 1000))
             angle = node.get("angle")
             if angle is not None and not _is_pos_number(angle):
                 errors.append("%s: 'angle' must be a positive number (RADIANS; omit for a full 360°)." % label)
+            # operation is optional; omitting it keeps the historical boss behaviour.
+            if node.get("operation", "boss") not in ("boss", "cut"):
+                errors.append("%s: 'operation' must be 'boss' or 'cut' (got %r; omit for boss)."
+                              % (label, node.get("operation")))
 
         elif ntype == "rib":
             sk = node.get("sketch")
@@ -251,6 +870,9 @@ def validate(graph):
                 errors.append("%s: 'path' must reference an earlier sketch node (got '%s')." % (label, path))
             elif path == sk:
                 errors.append("%s: 'path' and 'sketch' (profile) must be two DIFFERENT sketch nodes." % label)
+            elif isinstance(prev, dict) and prev.get("id") == sk:
+                path_node = next((n for n in nodes[:pos] if isinstance(n, dict) and n.get("id") == path), None)
+                errors.extend("%s: %s" % (label, msg) for msg in _sweep_geometry_errors(prev, path_node))
 
         elif ntype == "linear_pattern":
             # Linear pattern (v0.7.0): canonical axis direction + flip; SINGLE direction by
@@ -339,6 +961,34 @@ def validate(graph):
                     if not isinstance(e, dict) or not _is_point3(e.get("near")):
                         errors.append("%s.edges[%d]: 'near' must be a 3D point [x, y, z] in meters."
                                       % (label, j))
+
+        elif ntype == "shell":
+            # Hollow an EXISTING solid to a uniform wall (v0.8.0). `body` fixes the ORDER and
+            # records which solid is hollowed; the faces left open are face anchors resolved on
+            # the PRE-shell geometry (the shell consumes them) — the same pre-consumption rule
+            # as fillet/chamfer's edge anchors. Zero or one removal faces; none = closed shell.
+            tgt = node.get("body")
+            if not isinstance(tgt, str) or not tgt:
+                errors.append("%s: 'body' (id of an earlier body-producing node) is required." % label)
+            elif seen.get(tgt) not in BODY_PRODUCERS:
+                errors.append("%s: 'body' must reference an earlier %s node (got '%s')."
+                              % (label, "/".join(sorted(BODY_PRODUCERS)), tgt))
+            if not _is_pos_number(node.get("thickness")):
+                errors.append("%s: 'thickness' must be a positive number (meters), smaller than "
+                              "the thinnest section of the body." % label)
+            faces = node.get("faces_to_remove")
+            if faces is not None:
+                if not isinstance(faces, list):
+                    errors.append("%s: 'faces_to_remove' must be an array of face anchors "
+                                  "({near:[x,y,z], hint?}) — omit it or pass [] for a closed shell."
+                                  % label)
+                else:
+                    for j, f in enumerate(faces):
+                        if not isinstance(f, dict) or not _is_point3(f.get("near")):
+                            errors.append("%s.faces_to_remove[%d]: 'near' must be a 3D point "
+                                          "[x, y, z] in meters." % (label, j))
+            if node.get("outward") is not None and not isinstance(node.get("outward"), bool):
+                errors.append("%s: 'outward' must be a boolean." % label)
 
         elif ntype == "sheet_metal":
             # Base flange: consumes the ACTIVE sketch, so it must immediately follow its sketch
@@ -549,7 +1199,209 @@ def validate(graph):
         if nid:
             seen[nid] = ntype
 
+    errors.extend(_check_contour_closure(nodes))
     return errors
+
+
+# Consumers that need the ACTIVE sketch's contour to CLOSE (the sketch must immediately
+# precede extrude/revolve/sheet_metal/sweep-profile; loft profiles are referenced by id).
+# rib and sketched_bend consume OPEN profiles by design; a sweep's `path` sketch is an
+# open chain by design — none of them impose closure.
+_CLOSURE_CONSUMERS = frozenset(("extrude", "revolve", "sheet_metal", "sweep"))
+
+
+def _check_contour_closure(nodes):
+    """Plan-time contour checks for sketches whose consumer needs a closed region.
+
+    Zero execution calls. Two independent jobs, because the two failure classes differ:
+      - the CHAIN walk (line/arc): every still-open endpoint is reported with the exact gap and
+        its nearest neighbour, so the planner fixes coordinates instead of discovering the
+        failure as a mid-build EXTRUSION_FAILED + rollback.
+      - the CLOSED-primitive walk (contours.loop_conflicts): the five kinds that enclose a region
+        by construction, which have no endpoints to weld and so are invisible to the chain walk.
+    """
+    consumer_of = {}  # sketch node id -> "extrude 'e1'"-style consumer label
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        ntype = node.get("type")
+        nid = node.get("id")
+        if ntype in _CLOSURE_CONSUMERS:
+            sk = node.get("sketch")
+            if isinstance(sk, str):
+                consumer_of.setdefault(sk, []).append("%s '%s'" % (ntype, nid))
+        elif ntype == "loft":
+            for pid in node.get("profiles") or ():
+                if isinstance(pid, str):
+                    consumer_of.setdefault(pid, []).append("loft '%s'" % nid)
+    errors = []
+    for pos, node in enumerate(nodes):
+        if not isinstance(node, dict) or node.get("type") != "sketch":
+            continue
+        nid = node.get("id")
+        if nid not in consumer_of:
+            continue
+        key = nid
+        label = "sketch '%s'" % nid
+        profile = node.get("profile")
+        if not isinstance(profile, list):
+            continue  # shape errors already reported in the per-node pass
+        profile, fillet_problems = contours.resolve_fillets(profile)
+        if fillet_problems:
+            continue  # reported in the per-node pass; the corners are not resolved yet
+        consumers = "/".join(consumer_of[key])
+        # SolidWorks draws an arc from its START radius, so an end point off that circle opens
+        # the contour mid-build (EXTRUSION_FAILED). Within the weld band lowering recentres the
+        # arc; anything larger is a wrong centre the planner must recompute.
+        arc_problems = contours.arc_radius_problems(profile)
+        for bad in arc_problems[:4]:
+            if bad["how"] == "no-radius":
+                errors.append(
+                    "nodes[%d] (%s): profile[%d] (arc) has an endpoint on its centre (radii %.4f / "
+                    "%.4f mm) — an arc needs cx,cy at its radius from BOTH endpoints."
+                    % (pos, label, bad["prim"], bad["r1"] * 1000, bad["r2"] * 1000))
+            elif bad["how"] == "centre-shift":
+                errors.append(
+                    "nodes[%d] (%s): profile[%d] (arc) end point is not on its circle — radius "
+                    "%.4f mm at the start, %.4f mm at the end. On this shallow arc, putting both "
+                    "endpoints on one circle would move the centre %.3f mm (automatic limit "
+                    "%.1f mm), which would break concentricity with anything drawn at it. "
+                    "Recompute cx,cy so both endpoints are equidistant; keep the shared endpoints."
+                    % (pos, label, bad["prim"], bad["r1"] * 1000, bad["r2"] * 1000,
+                       bad["shift"] * 1000, contours.CONTOUR_WELD_TOL * 1000))
+            else:
+                errors.append(
+                    "nodes[%d] (%s): profile[%d] (arc) end point is not on its circle — radius "
+                    "%.4f mm at the start, %.4f mm at the end. SolidWorks draws the arc from the "
+                    "start radius, so the contour would open by %.4f mm. Recompute cx,cy so both "
+                    "endpoints are equidistant (a tangent arc's centre lies on the normal through "
+                    "the tangent point); keep the shared endpoints."
+                    % (pos, label, bad["prim"], bad["r1"] * 1000, bad["r2"] * 1000,
+                       abs(bad["r1"] - bad["r2"]) * 1000))
+        if arc_problems:
+            continue  # its gap/collapse findings would only restate the bad centre
+        # P1-1: the weld tolerance can collapse a genuinely thin feature (or a stray spike)
+        # to a zero-length entity, which SolidWorks cannot build. Report it here rather than
+        # letting the build fail mid-flight. Checked BEFORE the open-gap walk because a
+        # collapsed contour's endpoints all coincide, so it would otherwise look closed.
+        collapsed = contours.collapsed_entities(profile)
+        if collapsed:
+            parts = ["profile[%d] (%s), span %.6g m" % (c["prim"], c["kind"], c["span"])
+                     for c in collapsed[:4]]
+            if len(collapsed) > 4:
+                parts.append("+%d more" % (len(collapsed) - 4))
+            errors.append(
+                "nodes[%d] (%s): %s — the contour weld (gaps <= %g m) collapsed the entity to "
+                "a zero-length segment. Move the endpoints apart or widen the feature."
+                % (pos, label, "; ".join(parts), contours.CONTOUR_WELD_TOL))
+            continue
+        gaps = contours.open_gaps(profile)
+        if gaps:
+            parts = []
+            for g in gaps[:4]:
+                if g["nearest_prim"] is not None:
+                    nearest = (" — no partner within %g m (nearest: profile[%d] (%s) %s, "
+                               "%.6g m away)" % (contours.CONTOUR_WELD_TOL, g["nearest_prim"],
+                                                 g["nearest_kind"], g["nearest_which"],
+                                                 g["nearest_gap"]))
+                else:
+                    nearest = " — no other chain endpoint in the profile"
+                parts.append("profile[%d] (%s) %s at (%.6g, %.6g)%s"
+                             % (g["prim"], g["kind"], g["endpoint"], g["x"], g["y"], nearest))
+            if len(gaps) > 4:
+                parts.append("+%d more open endpoint(s)" % (len(gaps) - 4))
+            errors.append(
+                "nodes[%d] (%s): open contour for %s — %s. Chain segments close ONLY "
+                "through exact shared endpoint coordinates (the compiler welds gaps <= %g m); "
+                "correct the endpoints, close the loop, or mark non-contour segments "
+                "construction:true."
+                % (pos, label, consumers, "; ".join(parts), contours.CONTOUR_WELD_TOL))
+        elif contours.collapsed_profile(profile):
+            # Closed (every endpoint paired) yet the outline has no enclosed area: the weld
+            # merged a thin feature shut. Only meaningful once closure holds.
+            ext = contours.profile_extent(profile)
+            errors.append(
+                "nodes[%d] (%s): closed contour for %s has collapsed to a line/point "
+                "(bounding span %.6g x %.6g m <= weld tolerance %g m) — no enclosed area "
+                "remains. Widen the profile."
+                % (pos, label, consumers, ext[2] - ext[0], ext[3] - ext[1],
+                   contours.CONTOUR_WELD_TOL))
+        # v0.8.0 batch 6: the chain walk above is blind to the CLOSED-by-construction kinds
+        # (slot, rounded_rect, rectangle, circle, ellipse) — they enclose a region on their own,
+        # so they have no endpoints to weld and never show up as a gap. Two of them that overlap
+        # in one sketch passed validation and only failed in SolidWorks as a null cut
+        # (EXTRUSION_FAILED, 2026-10-26: the five-slot fan, all drawn horizontal). Run the
+        # polygon overlap check on every closure-consuming sketch, in ADDITION to the chain
+        # checks — a profile may mix chains and composites.
+        errors.extend("nodes[%d] (%s): %s" % (pos, label, msg)
+                      for msg in _loop_conflict_errors(profile, consumers))
+        if not gaps:
+            errors.extend("nodes[%d] (%s): %s" % (pos, label, msg)
+                          for msg in _chain_conflict_errors(profile, consumers))
+    return errors
+
+
+def _chain_conflict_errors(profile, consumers):
+    """VALIDATION_FAILED text for a closed chain that crosses or retraces itself."""
+    conflicts = contours.chain_conflicts(profile)
+    if not conflicts:
+        return []
+    parts = []
+    for c in conflicts[:4]:
+        where = "(%.6g, %.6g)" % c["point"]
+        if c["how"] == "collinear":
+            parts.append("profile[%d] (%s) and profile[%d] (%s) run along the same line near %s"
+                         % (c["a"], c["a_kind"], c["b"], c["b_kind"], where))
+        else:
+            parts.append("profile[%d] (%s) crosses profile[%d] (%s) at %s"
+                         % (c["a"], c["a_kind"], c["b"], c["b_kind"], where))
+    return [
+        "self-intersecting contour for %s — %s. Every endpoint is paired, but a contour must be "
+        "a simple loop: each segment meets only its two neighbours, at shared endpoints. Delete "
+        "the segment that retraces another, or fix the one that crosses (an arc whose dir is "
+        "wrong sweeps the long way round, through the rest of the outline)."
+        % (consumers, "; ".join(parts))]
+
+
+def _loop_conflict_errors(profile, consumers):
+    """VALIDATION_FAILED text for closed loops in one sketch that cannot both be built."""
+    conflicts = contours.loop_conflicts(profile)
+    if not conflicts:
+        return []
+    parts = []
+    for c in conflicts[:4]:
+        # "cross"/"self-cross" name the exact crossing; "collinear"/"mutual" have no single
+        # crossing to point at, so the coordinate is the shared region's centre and is labelled
+        # as near rather than at.
+        at = "near" if c["how"] in ("collinear", "mutual") else "at"
+        where = "" if c["point"] is None else " %s (%.6g, %.6g)" % (at, c["point"][0],
+                                                                    c["point"][1])
+        if c["how"] == "degenerate":
+            parts.append("profile[%d] (%s) encloses no area" % (c["a"], c["a_kind"]))
+        elif c["how"] == "self-cross":
+            parts.append("profile[%d] (%s) crosses itself%s" % (c["a"], c["a_kind"], where))
+        elif c["how"] == "collinear":
+            parts.append("profile[%d] (%s) runs along profile[%d] (%s) with coincident edges%s"
+                         " — the same contour written twice?"
+                         % (c["a"], c["a_kind"], c["b"], c["b_kind"], where))
+        elif c["how"] == "mutual":
+            parts.append("profile[%d] (%s) overlaps profile[%d] (%s) — each reaches inside the "
+                         "other%s" % (c["a"], c["a_kind"], c["b"], c["b_kind"], where))
+        else:
+            parts.append("profile[%d] (%s) crosses profile[%d] (%s)%s"
+                         % (c["a"], c["a_kind"], c["b"], c["b_kind"], where))
+        if c["more"]:
+            parts[-1] += " (+%d more crossings)" % c["more"]
+    if len(conflicts) > 4:
+        parts.append("+%d more overlapping pair(s)" % (len(conflicts) - 4))
+    return [
+        "overlapping closed contours for %s — %s. A closed primitive (slot, rounded_rect, "
+        "rectangle, circle, ellipse) is a contour by itself, so two of them in one sketch must "
+        "be DISJOINT or properly NESTED (a hole inside an outline) — never crossing, touching "
+        "along an edge, or running through each other, and never a loop that crosses itself. "
+        "Separate them, delete the duplicate, or if they must share a boundary merge them into "
+        "one chain of line/arc segments."
+        % (consumers, "; ".join(parts))]
 
 
 def _check_extrude_end(node, op, label, errors):
@@ -610,13 +1462,63 @@ def _check_datum(node, label, errors):
         errors.append("%s: ref.offset must be a signed number (meters)." % label)
 
 
+def _sweep_geometry_errors(profile_node, path_node):
+    """Plan-time checks of where a sweep path meets its profile (2026-11-09).
+
+    SolidWorks starts a sweep where the path pierces the profile's plane, and a profile wider than
+    the path's tightest bend folds into itself; both come back as a null sweep mid-build with
+    nothing to learn from. Checked only when both sketches sit on datum planes (their frames are
+    known before anything runs); a face sketch is left to the build."""
+    if not (isinstance(path_node, dict) and isinstance(profile_node.get("profile"), list)
+            and isinstance(path_node.get("profile"), list)):
+        return []
+    pf = canonical_sketch_frame(profile_node.get("ref") or {}) if profile_node.get("frame") is None         else profile_node.get("frame")
+    qf = canonical_sketch_frame(path_node.get("ref") or {}) if path_node.get("frame") is None         else path_node.get("frame")
+    if not (isinstance(pf, dict) and isinstance(qf, dict)):
+        return []
+    try:
+        po, px, py = (pf[k] for k in ("origin", "xdir", "ydir"))
+        qo, qx, qy = (qf[k] for k in ("origin", "xdir", "ydir"))
+    except KeyError:
+        return []
+    normal = (px[1] * py[2] - px[2] * py[1], px[2] * py[0] - px[0] * py[2], px[0] * py[1] - px[1] * py[0])
+    ends = contours.chain_ends(path_node["profile"])
+    if len(ends) != 2:
+        return []  # a closed or branching path is reported elsewhere / left to the build
+    world = [tuple(qo[k] + u * qx[k] + v * qy[k] for k in range(3)) for u, v in ends]
+    off = [sum((w[k] - po[k]) * normal[k] for k in range(3)) for w in world]
+    near = min(range(2), key=lambda i: abs(off[i]))
+    if abs(off[near]) > contours.CONTOUR_WELD_TOL:
+        return ["the sweep path never reaches the profile's plane — its ends are %.2f mm and %.2f mm "
+                "from it. SolidWorks starts a sweep where the path pierces the profile plane: put the "
+                "profile sketch on a plane through one end of the path (normal to the path there)."
+                % (abs(off[0]) * 1000, abs(off[1]) * 1000)]
+    rel = [world[near][k] - po[k] for k in range(3)]
+    pierce = (sum(rel[k] * px[k] for k in range(3)), sum(rel[k] * py[k] for k in range(3)))
+    rings = contours.profile_rings(profile_node["profile"])
+    if not rings:
+        return []
+    if contours.point_in_profile(profile_node["profile"], pierce) is False:
+        return ["the sweep path meets the profile plane at (%.2f, %.2f) mm in the profile sketch, outside "
+                "the profile's actual contour (being inside its bounding box is not enough); draw the "
+                "profile around the path's end." % (pierce[0] * 1000, pierce[1] * 1000)]
+    pts = [point for ring in rings for point in ring]
+    reach = max(math.hypot(q[0] - pierce[0], q[1] - pierce[1]) for q in pts)
+    bend = contours.smallest_bend(path_node["profile"])
+    if bend is not None and reach >= bend:
+        return ["the profile reaches %.2f mm from the path but the path bends at R%.2f mm: the swept "
+                "body would fold into itself at that bend. Use a bend radius larger than the profile "
+                "(the drawing's centreline radius), or check the profile size." % (reach * 1000, bend * 1000)]
+    return []
+
+
 def _check_profile_prim(prim, label, errors):
     if not isinstance(prim, dict):
         errors.append("%s must be an object." % label)
         return
     kind = prim.get("kind")
     if kind not in PROFILE_KINDS:
-        errors.append("%s.kind '%s' unsupported in v0.5 (only %s)." % (label, kind, sorted(PROFILE_KINDS)))
+        errors.append("%s.kind '%s' unsupported (only %s)." % (label, kind, sorted(PROFILE_KINDS)))
         return
     for flag in sorted(PROFILE_FLAGS):
         if prim.get(flag) is not None and not isinstance(prim.get(flag), bool):
@@ -625,6 +1527,12 @@ def _check_profile_prim(prim, label, errors):
         for k in ("width", "height"):
             if not _is_pos_number(prim.get(k)):
                 errors.append("%s: rectangle '%s' must be a positive number." % (label, k))
+        # v0.8.0 batch 7: an optional centre, the same idiom circle/slot/rounded_rect use. Before
+        # it lowering IGNORED cx/cy and drew the rectangle on the origin anyway — a planner that
+        # wrote a plausible-looking centre got wrong geometry with no error at all.
+        for k in ("cx", "cy"):
+            if prim.get(k) is not None and not _is_number(prim.get(k)):
+                errors.append("%s: rectangle '%s' must be a number." % (label, k))
     elif kind == "circle":
         if not _is_pos_number(prim.get("diameter")):
             errors.append("%s: circle 'diameter' must be a positive number." % label)
@@ -642,6 +1550,17 @@ def _check_profile_prim(prim, label, errors):
         if prim.get("dir") not in (1, -1):
             errors.append("%s: arc 'dir' must be 1 (CCW) or -1 (CW) — centre+start+end alone "
                           "describe two arcs." % label)
+    elif kind == "fillet":
+        # 2026-11-09: rounds the corner between its two list neighbours with an exact tangent arc
+        # (contours.resolve_fillets); the planner gives only the radius the drawing states.
+        if not _is_pos_number(prim.get("radius")):
+            errors.append("%s: fillet 'radius' must be a positive number (meters)." % label)
+        if prim.get("construction") is True:
+            errors.append("%s: a fillet rounds a real corner; it cannot be construction." % label)
+        extra = sorted(set(prim) - {"kind", "radius", "construction"})
+        if extra:
+            errors.append("%s: fillet takes only 'radius' (got %s); the corner comes from its two "
+                          "neighbours in the profile list." % (label, ", ".join(extra)))
     elif kind == "ellipse":
         # Centre + a point on the MAJOR axis + a point on the MINOR axis — exactly the reader's
         # shape and add_sketch_entity(ellipse)'s inputs (round-trips verbatim).
@@ -656,3 +1575,47 @@ def _check_profile_prim(prim, label, errors):
                 or not all(_is_number(v) for v in pts)):
             errors.append("%s: spline 'points' must be a FLAT number list [x1, y1, x2, y2, ...] "
                           "with >= 2 points (even count)." % label)
+    elif kind == "slot":
+        # v0.7.4 convenience primitive (expanded to exact line/arc entities at lowering):
+        # overall length > width, optional cx/cy centre like a circle. length == width is a
+        # circle — model it as one.
+        if not _is_pos_number(prim.get("length")):
+            errors.append("%s: slot 'length' (overall) must be a positive number." % label)
+        if not _is_pos_number(prim.get("width")):
+            errors.append("%s: slot 'width' must be a positive number." % label)
+        if (_is_pos_number(prim.get("length")) and _is_pos_number(prim.get("width"))
+                and prim["length"] <= prim["width"]):
+            errors.append("%s: slot 'length' must be > 'width' (length == width is a circle)." % label)
+        for k in ("cx", "cy"):
+            if prim.get(k) is not None and not _is_number(prim.get(k)):
+                errors.append("%s: slot '%s' must be a number." % (label, k))
+        # v0.8.0 batch 5: 'angle' turns the composite about (cx, cy) — CCW in the sketch plane, RADIANS
+        # like every other angular IR field (revolve / chamfer / bend). Bounded to one turn
+        # because rotation is PERIODIC: a larger magnitude cannot mean anything the author
+        # intended, and in practice it means degrees were passed (90 instead of pi/2), which
+        # would silently draw a near-horizontal slot again — the exact defect the field fixes.
+        angle = prim.get("angle")
+        if angle is not None:
+            if not _is_number(angle):
+                errors.append("%s: slot 'angle' must be a number (RADIANS, CCW about cx/cy; "
+                              "omit for length along +X)." % label)
+            elif abs(angle) > 2 * math.pi:
+                errors.append("%s: slot 'angle' must be within +/-2*pi RADIANS (got %r) — a "
+                              "vertical slot is angle = pi/2 = 1.5707963267948966, not 90."
+                              % (label, angle))
+    elif kind == "rounded_rect":
+        # v0.7.4 convenience primitive: centred like rectangle, corner radius must leave all
+        # four edges non-degenerate.
+        for k in ("width", "height"):
+            if not _is_pos_number(prim.get(k)):
+                errors.append("%s: rounded_rect '%s' must be a positive number." % (label, k))
+        if not _is_pos_number(prim.get("radius")):
+            errors.append("%s: rounded_rect 'radius' must be a positive number." % label)
+        if (_is_pos_number(prim.get("width")) and _is_pos_number(prim.get("height"))
+                and _is_pos_number(prim.get("radius"))
+                and prim["radius"] * 2 >= min(prim["width"], prim["height"])):
+            errors.append("%s: rounded_rect 'radius' must be < min(width, height)/2 — at the "
+                          "limit the straight edges degenerate (use a slot or circle)." % label)
+        for k in ("cx", "cy"):
+            if prim.get(k) is not None and not _is_number(prim.get(k)):
+                errors.append("%s: rounded_rect '%s' must be a number." % (label, k))

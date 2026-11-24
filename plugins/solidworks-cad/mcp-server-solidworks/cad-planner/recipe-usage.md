@@ -68,8 +68,9 @@ original — these rules replace the readback discipline there. C1–C5 still ap
   the target's coordinate IN THE STATE the node executes (after all earlier nodes). Compute it
   from your own intended dimensions — and know the TOOL DEFAULTS that decide where geometry
   lands: a base flange thickens to the sketch plane's −normal side by default
-  (`reverse_thickness` flips, `symmetric_thickness` splits ±t/2); box/rectangle profiles are
-  centred on the sketch origin; extrude runs toward +normal (`reversed` flips). A missed
+  (`reverse_thickness` flips, `symmetric_thickness` splits ±t/2); box profiles are centred on
+  the sketch origin while a rectangle accepts optional `cx`/`cy` (default 0) that offset its
+  centre; extrude runs toward +normal (`reversed` flips). A missed
   anchor fails LOUD with the nearest distance — read it, correct the coordinate ONCE (the miss
   distance usually names the mistake, e.g. exactly one sheet thickness), never iterate blindly.
 - **Build direction from the datum.** A boss/extrude on a canonical datum builds toward the
@@ -79,12 +80,35 @@ original — these rules replace the readback discipline there. C1–C5 still ap
   (or a cut that removes nothing) is almost always the WRONG SIGN — flip the direction ONCE and
   resubmit; do not re-guess the geometry or iterate blindly (the loud failure IS the sign
   correction). Fixes the recurring top-hole-drilled-the-wrong-way bug.
+- **The datum's 2-D frame is fixed and measured** (batch 8, 2026-10-27 — 12 probe parts built
+  through the pipeline for this purpose, 3 datums x boss / reversed / offset / negative offset;
+  those probe parts are local scratch files, not shipped in the repo; the same table is in the
+  schema at `reference_model.datum_frame`). A sketch's `cx/cy`, `x1/y1`, … are coordinates along THIS x/y, not
+  along model axes, so read this before placing a profile off-centre:
+
+  ```
+  datum | sketch +x | sketch +y | +normal | blind boss grows into | reversed grows into | positive offset d moves the plane to
+  front | +X | +Y | +Z | +Z | -Z | Z=+d
+  top | +X | -Z | +Y | +Y | -Y | Y=+d
+  right | -Z | +Y | +X | +X | -X | X=+d
+  ```
+
+  Measured invariants of the same run: `handedness: sketch_x x sketch_y = +normal on all three
+  (right-handed): front +X x +Y = +Z, top +X x -Z = +Y, right -Z x +Y = +X`; `origin: the sketch
+  origin IS the model origin on every datum (no in-plane shift), and an offset plane keeps the SAME
+  xdir/ydir — the offset moves the plane along the normal, it never rotates the 2-D frame`;
+  `independent: offset moves the PLANE only; reversed flips the GROWTH direction only — a reversed
+  probe kept its twin's in-plane extents, and an offset probe kept growing toward +normal`;
+  `negative offset: d < 0 lands the plane on the -normal side (front d=-0.012 -> pad Z in
+  [-0.012, -0.008]) and the blind boss still grows toward +normal from there`. Verify a frame
+  without rebuilding anything: `analyze_model(features)` prints each sketch's
+  `plane.frame {origin, xdir, ydir}` read from the document — xdir IS sketch +x in model axes.
 - **Prefer the forward-friendly forms:** `edge_flange` with `length` (not frame+profile —
   those exist for verbatim replay); `material {name, library?}` at graph level; a GRID as a
   pattern OF a pattern (a `linear_pattern` seeding on an earlier `linear_pattern` — the tool
   has no second direction).
-- **Know what is NOT expressible** (state it, don't improvise a lookalike): sweep/revolve/loft
-  are BOSS-only; no shell/draft/dome/wrap/hole-wizard/thread; `linear_pattern` is
+- **Know what is NOT expressible** (state it, don't improvise a lookalike): sweep/loft
+  are BOSS-only (a revolve takes `operation: "boss" | "cut"`); no draft/dome/wrap/hole-wizard/thread; `linear_pattern` is
   single-direction (+`flip`); mirror planes are canonical datums only. If the intent needs one
   of these, report the gap (C5).
 - **Self-verify without an original:** before submitting, COMPUTE the expected outcome from
@@ -101,9 +125,9 @@ original — these rules replace the readback discipline there. C1–C5 still ap
 
 1. Walk `recipe.features` in order; classify each against the CURRENT covered vocabulary —
    **the schema IS the registry**: read the node types from `feature-graph.schema.json`
-   (the `schema://feature-graph` resource). Part vocabulary (0.7.2-draft): `box`,
+   (the `schema://feature-graph` resource). Part vocabulary (0.8.0-draft): `box`,
    `sketch`+`extrude` boss/cut (ends blind / through_all / up_to_surface / mid_plane),
-   `hole`-on-face, `fillet`, `chamfer`, `revolve`, `sweep`, `rib`, `loft`, `linear_pattern`,
+   `hole`-on-face, `fillet`, `chamfer`, `shell`, `revolve`, `sweep`, `rib`, `loft`, `linear_pattern`,
    `circular_pattern`, `mirror`, `sheet_metal`, `sketched_bend`, `edge_flange` (custom-profile
    or simple length mode); profiles rectangle/circle/line/arc/ellipse/spline + construction;
    sketch supports = datums front/top/right with a signed `offset` OR a `ref.face` anchor; an
@@ -121,12 +145,32 @@ original — these rules replace the readback discipline there. C1–C5 still ap
 
 ## mapping_part — Part-vocabulary rules
 
-- **ALWAYS record each sketch's `frame`.** `analyze_model(sketch)` reports
-  `plane.frame {origin, xdir, ydir}` (the sketch→model axes). Copy it verbatim onto the IR
-  sketch node. `{ref, offset}` alone is LOSSY — it drops the support's normal sign and the
-  in-plane axis orientation, so a sketch on a −Y-normal face is the MIRROR of one on a +Y-normal
-  plane at the same height. The compiler compares the recorded frame against the frame
-  `create_sketch` MEASURES on the rebuild and transforms every coordinate.
+- **Recorded CAD vs new drawing coordinates.** When replaying an existing CAD sketch,
+  copy its measured `plane.frame {origin,xdir,ydir}` verbatim to the sketch node.
+  For a new drawing sketch, omitted frame declares canonical axes at signed offset d:
+  front O=[0,0,d], X=[1,0,0], Y=[0,1,0]; top O=[0,d,0], X=[1,0,0], Y=[0,0,-1];
+  right O=[d,0,0], X=[0,0,-1], Y=[0,1,0]. An equivalent face support does not change
+  these coordinates. The compiler transforms into create_sketch's measured frame; finite
+  orthonormal axes and coincident planes (1e-6 m) are mandatory. Missing measured frame
+  fails explicitly. A face-only ref without frame retains native face coordinates.
+  Extrude reversed is relative to the declared normal. Cuts do not send strict_direction:
+  a null cut retries the opposite direction, and a successful retry reports direction_flipped
+  in the execution response, compiler node/operation and DIRECTION_FLIPPED warnings. Check
+  the flagged feature's location, depth and direction by readback AND all three views.
+  Through-all success does not prove blind direction.
+- **Bounded placement repair (DSH L4).** After verified discarded, at most 2 complete repair
+  executions are persisted across jobs. Lock node count/ordered (type,operation), material
+  name/library, all non-placement dimensions/specs/end types and intrinsic sketch shape
+  (1e-9 m tolerance). Placement anchors, reversed, ref/datum/face/signed offset, frame and whole-sketch rigid
+  motion/mirror may change; ids/names/descriptions may change. Never omit features or change
+  blind to through. Supply error_code/cause/readback/change, matching the preceding error;
+  second repair needs new evidence, never identical replay or reset/renumbering to evade counts.
+  Inadmissible, exhausted, context-changed, in_flight or unverified recovery requests USER
+  confirmation; approval archives the old chain as user_override and starts a new first
+  execution at count 0, as one prompt; fresh graphs need no batch approval; Save As stays separate.
+  Confirmation does not close residual docs or verify Undo. Existing-document failures cannot
+  retry automatically. Stable document blocks retire when absent, never key by title.
+- Face preference changes support only: missing sketch.frame declares the canonical datum/offset frame, and coordinates are mapped into create_sketch measured axes; no implicit mirror is allowed.
 - **Path profiles carry EXACT coordinates.** When a sketch is not a single rectangle/circle,
   read its full geometry with `analyze_model(analysis_type='sketch', name=…)` and emit one
   primitive per segment, in segment order, coordinates verbatim (6 decimals): `line
@@ -134,9 +178,11 @@ original — these rules replace the readback discipline there. C1–C5 still ap
   centre+start+end alone describe two arcs), `circle {diameter, cx, cy}`. Copy each segment's
   `construction: true` flag. Do NOT add constraints or dimensions — identical shared endpoints
   close the contour and the lifted `_params` (C3) carry the design intent.
-- **Extrude direction: trust the recipe's `reversed` flag verbatim.** The reader normalizes
-  `reversed` against the canonical plane axis, which is exactly the rebuild's frame:
-  `reversed: true` in the recipe ⇒ `"reversed": true` on the IR extrude node, nothing else.
+- **Extrude direction is relative to the declared sketch normal.** Keep the approved
+  signed direction when authoring a graph; the compiler compensates if the measured support
+  normal is mirrored. For readback recipes, reconcile any reader-normalized direction with
+  the recorded frame before replay; do not assume that a measured frame is canonical.
+  A successful through-all cannot validate a blind cut's signed depth.
 - **`end: 'up_to_surface'` needs a face anchor** (`up_to.face.near` + optional `hint`): a point
   ON the terminating face's plane, taken from the ORIGINAL part's `analyze_model(faces)`
   representative point of that face. The resolver matches by plane containment on the rebuilt

@@ -64,6 +64,7 @@ namespace SolidworksExecution.Services
                     results.Add($"cx={props[0]:G6}");
                     results.Add($"cy={props[1]:G6}");
                     results.Add($"cz={props[2]:G6}");
+                    AddBoundingBoxResults(modelDoc, results);
                 }
                 else if (analysisType == "geometry")
                 {
@@ -93,6 +94,7 @@ namespace SolidworksExecution.Services
                     results.Add($"faces={totalFaces}");
                     results.Add($"edges={totalEdges}");
                     results.Add($"vertices={totalVerts}");
+                    AddBoundingBoxResults(modelDoc, results);
                 }
                 else if (analysisType == "bodies")
                 {
@@ -168,7 +170,8 @@ namespace SolidworksExecution.Services
                     double[] near = ParseVec3(p?.Value<string>("near"));
                     double[] axis = ParseVec3(p?.Value<string>("axis"));
                     int k = p?.Value<int?>("k") ?? 0;
-                    JObject edgeAnalysis = ReadEdges(partDoc, near, k, axis);
+                    double[][] points = ParsePoints(p?.Value<string>("points"));
+                    JObject edgeAnalysis = ReadEdges(partDoc, near, k, axis, points);
                     results.Add(edgeAnalysis.ToString(Newtonsoft.Json.Formatting.None));
                 }
                 else if (analysisType == "faces")
@@ -1262,37 +1265,162 @@ namespace SolidworksExecution.Services
             catch { return null; }
         }
 
+        // The UNROUNDED body volume (m3) from the same GetMassProperties2 read BuildBodySummary
+        // uses, or null when the document reports nothing. Verifiers that compare a before/after
+        // DELTA must read this, not BuildBodySummary's "volume": that echo is R6 (1e-6 m3 = 1 mm3),
+        // a million times coarser than the 1e-12 "unchanged" threshold, so on a small or thin part
+        // a real change rounds away and the feature gets reported FAILED (a shell of a 10 mm cube
+        // at 0.2 mm: dV = 1.1488e-7 m3 — both sides round to 0.000001). Read-only; not part of
+        // state/idempotency.
+        private static double? RawVolume(IModelDoc2 modelDoc)
+        {
+            try
+            {
+                int st = 0;
+                object raw = modelDoc.GetMassProperties2(ref st);
+                double[] mp = raw as double[];
+                if (mp == null && raw is object[] oa) mp = Array.ConvertAll(oa, o => (double)o);
+                if (mp != null && mp.Length >= 4) return mp[3];
+                return null;
+            }
+            catch { return null; }
+        }
+
         // Round a coordinate/length (meters) to 6 decimals = 1µm. Below SW's selection tolerance,
         // so pick-points stay valid, while the edges JSON stays small enough for the MCP result cap.
         private static double R6(double v) { return Math.Round(v, 6); }
 
-        // Single-edge JSON (start/end/MIDPOINT, +length for closed edges) — the shared reader behind both
-        // ReadEdges and get_selection, so an analyzed edge and a user-selected edge report identical fields
-        // (the "analyze ⊆ everything else" invariant, ADR-023 spirit). `idx` is the edge's stable index.
+        // bbox keys are read by machines (size checks), so their numbers never depend on the
+        // machine's regional decimal separator.
+        private static string Num6(double v)
+        {
+            return R6(v).ToString("G6", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // Axis-aligned bounding box of the solid bodies, in meters — appended LAST by every scope
+        // that calls it, so no existing key moves. This is the size check a drawing-vs-model round trip
+        // needs ("is it 400 long?"), which faces cannot answer: a face's `point` is a mid-parameter,
+        // not an endpoint, so extents had to be reconstructed from whichever faces happened to exist.
+        // Union over the SAME solid-body enumeration the geometry/faces/bodies readers walk, so a
+        // multibody part reports the whole envelope and the counts stay comparable.
+        // Extents come from IBody2.GetExtremePoint along ±X/±Y/±Z, which is exact. GetBodyBox is only
+        // a quick enclosing box: on fillets, splines and helices it overshoots (jiaotazuo read 157.57
+        // for an exact 157.0, a 30×80×120 shell read 34.5×93.67×120 — H24, 2026-11-16). It is kept
+        // only as the per-body fallback when an extreme-point call fails.
+        // Silent when there is nothing to report (no solid body, or every call threw): the scope
+        // still completes with its historical keys rather than failing a read over an extents call.
+        private static void AddBoundingBoxResults(IModelDoc2 modelDoc, List<string> results)
+        {
+            var partDoc = modelDoc as IPartDoc;
+            if (partDoc == null) return;  // bbox is a part-document read (assembly envelopes are out of scope)
+
+            object[] bodies = null;
+            try { bodies = partDoc.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[]; }
+            catch { }
+            if (bodies == null || bodies.Length == 0) return;
+
+            double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue;
+            double maxX = double.MinValue, maxY = double.MinValue, maxZ = double.MinValue;
+            bool any = false;
+            foreach (var b in bodies)
+            {
+                var body = b as IBody2;
+                if (body == null) continue;
+                double[] box = ExactBodyBox(body);
+                if (box == null)
+                {
+                    try
+                    {
+                        // GetBodyBox: [0..2]=min xyz, [3..5]=max xyz, meters.
+                        object raw = body.GetBodyBox();
+                        box = raw as double[];
+                        if (box == null && raw is object[] oa) box = Array.ConvertAll(oa, o => (double)o);
+                    }
+                    catch { }
+                }
+                if (box == null || box.Length < 6) continue;
+                minX = Math.Min(minX, box[0]); minY = Math.Min(minY, box[1]); minZ = Math.Min(minZ, box[2]);
+                maxX = Math.Max(maxX, box[3]); maxY = Math.Max(maxY, box[4]); maxZ = Math.Max(maxZ, box[5]);
+                any = true;
+            }
+            if (!any) return;
+
+            results.Add($"bbox_min=[{Num6(minX)},{Num6(minY)},{Num6(minZ)}]");
+            results.Add($"bbox_max=[{Num6(maxX)},{Num6(maxY)},{Num6(maxZ)}]");
+            results.Add($"bbox_size=[{Num6(maxX - minX)},{Num6(maxY - minY)},{Num6(maxZ - minZ)}]");
+        }
+
+        // [minX, minY, minZ, maxX, maxY, maxZ] in meters from the body's extreme points along the six
+        // axis directions, or null if any call fails (the caller then falls back to GetBodyBox).
+        private static double[] ExactBodyBox(IBody2 body)
+        {
+            var box = new double[6];
+            for (int axis = 0; axis < 3; axis++)
+            {
+                for (int side = 0; side < 2; side++)
+                {
+                    double sign = side == 0 ? -1.0 : 1.0;
+                    double x, y, z;
+                    try
+                    {
+                        if (!body.GetExtremePoint(axis == 0 ? sign : 0, axis == 1 ? sign : 0, axis == 2 ? sign : 0,
+                                                  out x, out y, out z))
+                            return null;
+                    }
+                    catch { return null; }
+                    double v = axis == 0 ? x : axis == 1 ? y : z;
+                    if (double.IsNaN(v) || double.IsInfinity(v)) return null;
+                    box[side * 3 + axis] = v;
+                }
+            }
+            return box;
+        }
+
+        // ------------------------------------------------------------------
+        // Item readers = Fetch* (the COM round-trips) + Assemble* (pure JSON, no COM).
+        //
+        // SolidWorks is out-of-process and each of these calls costs ~0.1 s on a real part, so
+        // ReadEdges/ReadFaces fetch ONLY the keys the near/k/axis filter reads, run the filter, and pay
+        // for the keys nothing reads on a dropped item (closed-edge `length`, face `area`) once the
+        // survivors are known. Fetch order is the historical one and Assemble emits keys in the
+        // historical insertion order (Newtonsoft writes in insertion order and callers diff the
+        // resulting strings), so a filtered response is byte-identical to the old build-everything path.
+        // ------------------------------------------------------------------
+
+        // Single-edge JSON (start/end/MIDPOINT, +length for closed edges, +kind/center/normal/radius for
+        // closed edges whose curve is a circle) — the shared reader behind both ReadEdges and get_selection,
+        // so an analyzed edge and a user-selected edge report identical fields (the "analyze ⊆ everything
+        // else" invariant, ADR-023 spirit). `idx` is the edge's stable index.
         private JObject BuildEdgeJson(IEdge edge, int idx)
         {
-            var ej = new JObject();
-            ej["i"] = idx;
+            return AssembleEdge(FetchEdge(edge), idx);
+        }
+
+        private sealed class EdgeFacts
+        {
+            public double[] Cp;         // GetCurveParams2 result; null/short → the JSON carries only "i"
+            public bool Closed;         // chord(start,end) <= 1e-9 → mid has to come from the curve
+            public Curve Curve;         // closed edges only (IEdge.IGetCurve returns SolidWorks.Interop.sldworks.Curve)
+            public bool CurveRead;      // Evaluate2 returned: today a throw there also skips `length`
+            public double[] CurveMid;   // on-curve midpoint of a closed edge
+            public bool IsCircle;       // closed edges only: Curve.IsCircle() said yes
+            public double[] Circle;     // CircleParams raw [0..2]=center [3..5]=normal [6]=radius
+        }
+
+        private static EdgeFacts FetchEdge(IEdge edge)
+        {
+            var f = new EdgeFacts();
             try
             {
                 // GetCurveParams2 layout: [0..2]=start xyz, [3..5]=end xyz, [6]=uStart, [7]=uEnd, [8]=sense.
                 var cp = edge.GetCurveParams2() as double[];
                 if (cp != null && cp.Length >= 8)
                 {
-                    // Round to 6 decimals (1µm — far below selection tolerance). Keeps the JSON compact
-                    // (a 304-edge part otherwise blows the MCP result token cap) AND kills near-zero noise.
-                    ej["start"] = new JArray { R6(cp[0]), R6(cp[1]), R6(cp[2]) };
-                    ej["end"] = new JArray { R6(cp[3]), R6(cp[4]), R6(cp[5]) };
+                    f.Cp = cp;
                     double dx = cp[0] - cp[3], dy = cp[1] - cp[4], dz = cp[2] - cp[5];
                     double chord = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-                    if (chord > 1e-9)
-                    {
-                        // Open edge (the common case): the chord midpoint (start+end)/2 is EXACT for a line
-                        // and a robust pick-point for an arc. We do NOT call IGetCurve()/GetLength3() here —
-                        // on a large part those per-edge COM round-trips dominate (gear: 26s of a 58s total).
-                        ej["mid"] = new JArray { R6((cp[0] + cp[3]) / 2.0), R6((cp[1] + cp[4]) / 2.0), R6((cp[2] + cp[5]) / 2.0) };
-                    }
-                    else
+                    f.Closed = !(chord > 1e-9);
+                    if (f.Closed)
                     {
                         // Closed edge (full circle, start==end): the chord midpoint is the center, not on the
                         // edge — need the curve for an on-edge midpoint. Rare (a handful per part), so the
@@ -1300,88 +1428,289 @@ namespace SolidworksExecution.Services
                         var curve = edge.IGetCurve();
                         if (curve != null)
                         {
+                            f.Curve = curve;
                             var mid = curve.Evaluate2((cp[6] + cp[7]) / 2.0, 0) as double[];
-                            if (mid != null && mid.Length >= 3)
-                                ej["mid"] = new JArray { R6(mid[0]), R6(mid[1]), R6(mid[2]) };
-                            try { ej["length"] = R6(curve.GetLength3(cp[6], cp[7])); } catch { }
+                            f.CurveRead = true;
+                            if (mid != null && mid.Length >= 3) f.CurveMid = mid;
+                            // CIRCLE descriptor (its own try: a throw here must not drop `mid`/`length`).
+                            // Asked for by the cosmetic-thread resolver: a thread attaches to the CIRCULAR EDGE
+                            // at a bore mouth, and the only robust way to NAME that edge among several same-radius
+                            // circles (a bore's mouth and its far end are identical circles; add a counterbore and
+                            // you get four) is center + axis + radius. Probed ONLY on the closed path, where the
+                            // curve is already in hand — the open-edge path stays COM-call-free on purpose (see
+                            // ReadEdges' note: per-edge curve calls were 26 s of a 58 s read on a 304-edge gear).
+                            try
+                            {
+                                if (curve.IsCircle())
+                                {
+                                    f.Circle = SurfaceParamsArray(curve.CircleParams);
+                                    // Set the flag from the READ, not from IsCircle alone: the JSON keys are
+                                    // emitted together or not at all, so `kind` never promises a center it
+                                    // cannot deliver.
+                                    if (f.Circle != null && f.Circle.Length >= 7) f.IsCircle = true;
+                                }
+                            }
+                            catch { }
                         }
                     }
                 }
             }
             catch { }
+            return f;
+        }
+
+        // `withLength` false = the ranking form: start/end/mid only, which is all NarrowByNear reads.
+        private static JObject AssembleEdge(EdgeFacts f, int idx, bool withLength = true)
+        {
+            var ej = new JObject();
+            ej["i"] = idx;
+            var cp = f.Cp;
+            if (cp == null) return ej;
+            // Round to 6 decimals (1µm — far below selection tolerance). Keeps the JSON compact
+            // (a 304-edge part otherwise blows the MCP result token cap) AND kills near-zero noise.
+            ej["start"] = new JArray { R6(cp[0]), R6(cp[1]), R6(cp[2]) };
+            ej["end"] = new JArray { R6(cp[3]), R6(cp[4]), R6(cp[5]) };
+            if (!f.Closed)
+            {
+                // Open edge (the common case): the chord midpoint (start+end)/2 is EXACT for a line
+                // and a robust pick-point for an arc. We do NOT call IGetCurve()/GetLength3() here —
+                // on a large part those per-edge COM round-trips dominate (gear: 26s of a 58s total).
+                ej["mid"] = new JArray { R6((cp[0] + cp[3]) / 2.0), R6((cp[1] + cp[4]) / 2.0), R6((cp[2] + cp[5]) / 2.0) };
+                return ej;
+            }
+            if (f.CurveMid != null)
+                ej["mid"] = new JArray { R6(f.CurveMid[0]), R6(f.CurveMid[1]), R6(f.CurveMid[2]) };
+            if (withLength && f.Curve != null && f.CurveRead)
+                try { ej["length"] = R6(f.Curve.GetLength3(cp[6], cp[7])); } catch { }
+            // Circular-edge descriptor, APPENDED after the pre-existing keys so no existing key or
+            // key ORDER moves (the same rule the bbox and face-kind additions follow). Meters, R6.
+            // `normal` is the circle's own axis — for the mouth edge of a vertical bore that is
+            // [0,0,+/-1], which is what tells a bore mouth apart from the identical circle at its
+            // far end once you know the sign of the center along that axis.
+            if (f.IsCircle)
+            {
+                var c = f.Circle;
+                ej["kind"] = "circle";
+                ej["center"] = new JArray { R6(c[0]), R6(c[1]), R6(c[2]) };
+                ej["normal"] = new JArray { R6(c[3]), R6(c[4]), R6(c[5]) };
+                ej["radius"] = R6(c[6]);
+            }
             return ej;
         }
 
         // Single-face JSON (planar flag + normal/area/representative point for planar faces) — the shared
         // reader behind both ReadFaces and get_selection. `idx` is the face's stable index.
+        //
+        // Fetch steps are split from AssembleFace so ReadFaces can rank a face from surface + normal
+        // alone and skip the representative point (2 COM calls) and the area for faces the filter drops.
+        // Each fetch keeps the historical try nesting and call order, so the presence of every key —
+        // including the ones that only disappear because an earlier call threw — is unchanged.
         private JObject BuildFaceJson(IFace2 face, int idx)
         {
-            var fj = new JObject();
-            fj["i"] = idx;
+            var f = FetchFaceSurface(face);
+            if (f.HavePlanar)
+            {
+                FetchFaceArea(f);
+                FetchFaceNormal(f);
+                FetchFacePoint(f);
+            }
+            return AssembleFace(f, idx);
+        }
+
+        private sealed class FaceFacts
+        {
+            public IFace2 Face;
+            public Surface Surf;
+            public bool HavePlanar;   // false only when IGetSurface/IsPlane threw: then no key after i exists
+            public bool Planar;
+            public bool AreaRead;     // GetArea returned (its own try: a throw drops just the `area` key)
+            public double Area;
+            public bool ChainAborted; // a throw in the planar chain above — today it skips `point` too
+            public double[] Normal;
+            public string Kind;       // curved faces: cylinder / cone / sphere / torus
+            public double[] Cylinder; // CylinderParams raw; keys emitted only when it holds 7 entries
+            public double[] Torus;    // TorusParams raw; keys emitted only when it holds 8 entries
+            public double[] Sphere;   // SphereParams raw; keys emitted only when it holds 4 entries
+            public double[] Cone;     // ConeParams raw; keys emitted only when it holds 8 entries
+            public double[] Point;
+        }
+
+        private static FaceFacts FetchFaceSurface(IFace2 face)
+        {
+            var f = new FaceFacts { Face = face };
             try
             {
                 var surf = face.IGetSurface();
-                bool planar = surf != null && surf.IsPlane();
-                fj["planar"] = planar;
-                try { fj["area"] = R6(face.GetArea()); } catch { }
-                if (planar)
+                f.Surf = surf;
+                f.Planar = surf != null && surf.IsPlane();
+                f.HavePlanar = true;  // set only after IsPlane returned, as the old reader's assignment did
+            }
+            catch { }
+            return f;
+        }
+
+        private static void FetchFaceArea(FaceFacts f)
+        {
+            try { f.Area = f.Face.GetArea(); f.AreaRead = true; } catch { }
+        }
+
+        // Plane normal (model space) — the sketch-plane direction for on_face.
+        private static void FetchFaceNormal(FaceFacts f)
+        {
+            if (!f.Planar) return;
+            try { f.Normal = f.Face.Normal as double[]; }
+            catch { f.ChainAborted = true; }
+        }
+
+        // A representative point ON the plane (UV-mid of the trimmed face). Informational —
+        // selection is by index, so this need not be strictly inside a face with holes.
+        private static void FetchFacePoint(FaceFacts f)
+        {
+            if (f.ChainAborted) return;
+            if (f.Planar)
+            {
+                try
                 {
-                    // Plane normal (model space) — the sketch-plane direction for on_face.
-                    var n = face.Normal as double[];
-                    if (n != null && n.Length >= 3)
-                        fj["normal"] = new JArray { R6(n[0]), R6(n[1]), R6(n[2]) };
-                    // A representative point ON the plane (UV-mid of the trimmed face). Informational —
-                    // selection is by index, so this need not be strictly inside a face with holes.
-                    var uv = face.GetUVBounds() as double[];
+                    var uv = f.Face.GetUVBounds() as double[];
                     if (uv != null && uv.Length >= 4)
                     {
-                        var pt = surf.Evaluate((uv[0] + uv[1]) / 2.0, (uv[2] + uv[3]) / 2.0, 0, 0) as double[];
-                        if (pt != null && pt.Length >= 3)
-                            fj["point"] = new JArray { R6(pt[0]), R6(pt[1]), R6(pt[2]) };
+                        var pt = f.Surf.Evaluate((uv[0] + uv[1]) / 2.0, (uv[2] + uv[3]) / 2.0, 0, 0) as double[];
+                        if (pt != null && pt.Length >= 3) f.Point = pt;
                     }
                 }
-                else if (surf != null)
+                catch { }
+                return;
+            }
+            if (f.Surf == null) return;
+            // Non-planar faces: report the surface KIND + matching geometry (Phase B —
+            // a concentric mate's anchor is a CYLINDRICAL face; the resolver matches it
+            // by axis + radius). CylinderParams layout: [0..2]=origin, [3..5]=axis
+            // (unit), [6]=radius. All faces also get a representative on-surface point.
+            try
+            {
+                if (f.Surf.IsCylinder())
                 {
-                    // Non-planar faces: report the surface KIND + matching geometry (Phase B —
-                    // a concentric mate's anchor is a CYLINDRICAL face; the resolver matches it
-                    // by axis + radius). CylinderParams layout: [0..2]=origin, [3..5]=axis
-                    // (unit), [6]=radius. All faces also get a representative on-surface point.
-                    try
-                    {
-                        if (surf.IsCylinder())
-                        {
-                            fj["kind"] = "cylinder";
-                            var cp2 = surf.CylinderParams as double[];
-                            if (cp2 == null && surf.CylinderParams is object[] cpo)
-                                cp2 = Array.ConvertAll(cpo, o => (double)o);
-                            if (cp2 != null && cp2.Length >= 7)
-                            {
-                                fj["origin"] = new JArray { R6(cp2[0]), R6(cp2[1]), R6(cp2[2]) };
-                                fj["axis"] = new JArray { R6(cp2[3]), R6(cp2[4]), R6(cp2[5]) };
-                                fj["radius"] = R6(cp2[6]);
-                            }
-                        }
-                        else if (surf.IsCone()) fj["kind"] = "cone";
-                        else if (surf.IsSphere()) fj["kind"] = "sphere";
-                        var uv2 = face.GetUVBounds() as double[];
-                        if (uv2 != null && uv2.Length >= 4)
-                        {
-                            var pt2 = surf.Evaluate((uv2[0] + uv2[1]) / 2.0, (uv2[2] + uv2[3]) / 2.0, 0, 0) as double[];
-                            if (pt2 != null && pt2.Length >= 3)
-                                fj["point"] = new JArray { R6(pt2[0]), R6(pt2[1]), R6(pt2[2]) };
-                        }
-                    }
-                    catch { }
+                    f.Kind = "cylinder";
+                    var cp2 = f.Surf.CylinderParams as double[];
+                    if (cp2 == null && f.Surf.CylinderParams is object[] cpo)
+                        cp2 = Array.ConvertAll(cpo, o => (double)o);
+                    f.Cylinder = cp2;
+                }
+                else if (f.Surf.IsCone()) f.Kind = "cone";
+                else if (f.Surf.IsSphere()) f.Kind = "sphere";
+                // A TORUS is the fillet/round face class: until it had a kind, every fillet face came
+                // back as planar:false with no kind at all, so a torus was only tellable from a sphere
+                // by its representative point, and "did my R2 fillet land" was not machine-checkable.
+                else if (f.Surf.IsTorus()) f.Kind = "torus";
+                var uv2 = f.Face.GetUVBounds() as double[];
+                if (uv2 != null && uv2.Length >= 4)
+                {
+                    var pt2 = f.Surf.Evaluate((uv2[0] + uv2[1]) / 2.0, (uv2[2] + uv2[3]) / 2.0, 0, 0) as double[];
+                    if (pt2 != null && pt2.Length >= 3) f.Point = pt2;
                 }
             }
             catch { }
+            // The other curved kinds' parameters, in their own try: an exotic surface whose params
+            // throw must still report the kind and the point it already has (adding a key must never
+            // subtract one).
+            try { FetchCurvedSurfaceParams(f); } catch { }
+        }
+
+        // Curved-surface parameter layouts, ALL MEASURED on parts built through this service
+        // (2026-10-27, batch 8 — a 3 mm rim fillet = torus, a 5 mm corner fillet = cylinder, a
+        // 3x3 45-deg chamfer = cone, a revolved half-disc = sphere), not copied from docs:
+        //   TorusParams    8: [0..2]=ring centre (ON the tube centreline), [3..5]=axis (unit),
+        //                    [6]=major radius (to the centreline), [7]=minor radius (the tube).
+        //   SphereParams   4: [0..2]=centre, [3]=radius.
+        //   ConeParams     8: [0..2]=a point on the axis (NOT the apex), [3..5]=axis (unit),
+        //                    [6]=section radius at [0..2], [7]=half-angle in RADIANS.
+        // CylinderParams (7) is read where the kind is set, so this helper skips it.
+        private static void FetchCurvedSurfaceParams(FaceFacts f)
+        {
+            if (f.Surf == null || f.Kind == null || f.Kind == "cylinder") return;
+            if (f.Kind == "torus") f.Torus = SurfaceParamsArray(f.Surf.TorusParams);
+            else if (f.Kind == "sphere") f.Sphere = SurfaceParamsArray(f.Surf.SphereParams);
+            else if (f.Kind == "cone") f.Cone = SurfaceParamsArray(f.Surf.ConeParams);
+        }
+
+        private static double[] SurfaceParamsArray(object raw)
+        {
+            var d = raw as double[];
+            if (d != null) return d;
+            return raw is object[] oa ? Array.ConvertAll(oa, o => (double)o) : null;
+        }
+
+        private static JObject AssembleFace(FaceFacts f, int idx)
+        {
+            var fj = new JObject();
+            fj["i"] = idx;
+            if (f.HavePlanar) fj["planar"] = f.Planar;
+            if (f.AreaRead) fj["area"] = R6(f.Area);
+            if (f.Planar)
+            {
+                var n = f.Normal;
+                if (n != null && n.Length >= 3)
+                    fj["normal"] = new JArray { R6(n[0]), R6(n[1]), R6(n[2]) };
+                AddPoint(fj, f.Point);
+            }
+            else if (f.HavePlanar && f.Surf != null)
+            {
+                if (f.Kind != null) fj["kind"] = f.Kind;
+                var cp2 = f.Cylinder;
+                if (cp2 != null && cp2.Length >= 7)
+                {
+                    fj["origin"] = new JArray { R6(cp2[0]), R6(cp2[1]), R6(cp2[2]) };
+                    fj["axis"] = new JArray { R6(cp2[3]), R6(cp2[4]), R6(cp2[5]) };
+                    fj["radius"] = R6(cp2[6]);
+                }
+                // Additive per-kind geometry (a kind never sets another kind's keys): the torus radii
+                // make a fillet/round machine-checkable by radius alone, which is what the R2 root
+                // fillets and R0.5 groove rounds of a real shaft drawing need.
+                var tp = f.Torus;
+                if (tp != null && tp.Length >= 8)
+                {
+                    fj["origin"] = Pt6(tp);   // ring centre, on the tube CENTRELINE's circle
+                    fj["axis"] = new JArray { R6(tp[3]), R6(tp[4]), R6(tp[5]) };
+                    fj["major_radius"] = R6(tp[6]);
+                    fj["minor_radius"] = R6(tp[7]);
+                }
+                var sp = f.Sphere;
+                if (sp != null && sp.Length >= 4)
+                {
+                    fj["origin"] = Pt6(sp);
+                    fj["radius"] = R6(sp[3]);
+                }
+                var cn = f.Cone;
+                if (cn != null && cn.Length >= 8)
+                {
+                    // MEASURED 2026-10-27 on a 45-deg chamfer of an R10 boss rim: the array is EIGHT
+                    // doubles, [0..2] is a point ON the axis (NOT the apex), [6] is the section radius
+                    // AT that point and [7] is the half-angle in radians (0.7853981633974437 = pi/4).
+                    // The chamfer's own circles are r=0.007 at Y=0.020 and r=0.010 at Y=0.017, so
+                    // [0..2]=[0.028,0.02,0] with [6]=0.007 is exactly the (axis point, radius) pair —
+                    // naming [0..2] `apex` would have been a lie, and [6] as the angle was off by 100x.
+                    fj["origin"] = Pt6(cn);          // a point on the axis, where `radius` is measured
+                    fj["axis"] = new JArray { R6(cn[3]), R6(cn[4]), R6(cn[5]) };
+                    fj["radius"] = R6(cn[6]);        // section radius at origin
+                    fj["half_angle"] = R6(cn[7]);    // RADIANS, between the axis and the surface
+                }
+                AddPoint(fj, f.Point);
+            }
             return fj;
         }
 
-        private JObject ReadEdges(IPartDoc partDoc, double[] near = null, int k = 0, double[] axis = null)
+        private static void AddPoint(JObject fj, double[] pt)
+        {
+            if (pt != null) fj["point"] = new JArray { R6(pt[0]), R6(pt[1]), R6(pt[2]) };
+        }
+
+        private JObject ReadEdges(IPartDoc partDoc, double[] near = null, int k = 0, double[] axis = null,
+            double[][] points = null)
         {
             var root = new JObject();
-            var edgesArr = new JArray();
+            var rankArr = new JArray();
+            var byIndex = new Dictionary<int, EdgeFacts>();
+            bool filtering = near != null;
             int idx = 0;
             // Edge enumeration is COM-round-trip-bound (SolidWorks is out-of-process). On a large part
             // (gear = 304 edges) the per-edge curve calls dominated, so we keep them off the open-edge
@@ -1400,33 +1729,119 @@ namespace SolidworksExecution.Services
                     {
                         var edge = e as IEdge;
                         if (edge == null) continue;
-                        // BuildEdgeJson assigns the STABLE full-enumeration index `i` — kept even after a
+                        if (!filtering)
+                        {
+                            var ej = BuildEdgeJson(edge, idx);
+                            if (points != null) AddOnEdgeDistances(edge, ej, points);
+                            rankArr.Add(ej);
+                            idx++;
+                            continue;
+                        }
+                        // AssembleEdge assigns the STABLE full-enumeration index `i` — kept even after a
                         // near/k filter, so a filtered result still selects by the same index.
-                        edgesArr.Add(BuildEdgeJson(edge, idx++));
+                        // Rank on the keys NarrowByNear actually reads (start/end/mid); a closed edge's
+                        // `length` is fetched only if the edge survives.
+                        var f = FetchEdge(edge);
+                        byIndex[idx] = f;
+                        rankArr.Add(AssembleEdge(f, idx, false));
+                        idx++;
                     }
                 }
             }
             swTotal.Stop();
-            ExecLog.Write($"ReadEdges: edges={edgesArr.Count} total={swTotal.ElapsedMilliseconds}ms near={(near != null)} k={k}");
-            int totalCount = edgesArr.Count;
+            ExecLog.Write($"ReadEdges: edges={rankArr.Count} total={swTotal.ElapsedMilliseconds}ms near={(near != null)} k={k}");
+            int totalCount = rankArr.Count;
 
-            if (near != null)
+            if (!filtering)
             {
-                // The edge's representative point is its `mid`; the direction filter (axis) compares the
-                // edge's CHORD direction (start→end) — for a curved edge that's the chord, documented.
-                var filtered = NarrowByNear(edgesArr, near, k, axis, "mid",
-                    (ej) => EdgeChordDir(ej));
-                root["edge_count"] = filtered.Count;
-                root["total_edge_count"] = totalCount;
-                root["near"] = new JArray { R6(near[0]), R6(near[1]), R6(near[2]) };
-                if (k > 0) root["k"] = k;
-                if (axis != null) root["axis"] = new JArray { R6(axis[0]), R6(axis[1]), R6(axis[2]) };
-                root["edges"] = filtered;
+                root["edge_count"] = totalCount;
+                root["edges"] = rankArr;
                 return root;
             }
-            root["edge_count"] = totalCount;
-            root["edges"] = edgesArr;
+
+            // The edge's representative point is its `mid`; the direction filter (axis) compares the
+            // edge's CHORD direction (start→end) — for a curved edge that's the chord, documented.
+            var filtered = NarrowByNear(rankArr, near, k, axis, "mid",
+                (ej) => EdgeChordDir(ej));
+            var edgesOut = new JArray();
+            foreach (var item in filtered)
+            {
+                var jo = (JObject)item;
+                int i = jo["i"].Value<int>();
+                // Re-assembled from the keys already fetched above — no second COM round-trip apart from
+                // the closed-edge `length`. Same key order as the unfiltered path, then `dist` last.
+                var full = AssembleEdge(byIndex[i], i);
+                full["dist"] = jo["dist"].Value<double>();
+                edgesOut.Add(full);
+            }
+            root["edge_count"] = edgesOut.Count;
+            root["total_edge_count"] = totalCount;
+            root["near"] = new JArray { R6(near[0]), R6(near[1]), R6(near[2]) };
+            if (k > 0) root["k"] = k;
+            if (axis != null) root["axis"] = new JArray { R6(axis[0]), R6(axis[1]), R6(axis[2]) };
+            root["edges"] = edgesOut;
             return root;
+        }
+
+        // Opt-in `points` (a JSON array of [x,y,z], meters): the caller's edge anchors that no midpoint,
+        // straight segment or full circle could place — points ON open arcs, splines or intersection
+        // curves, which the open-edge path deliberately reads no curve for. For each such point the
+        // edge gets on_dist[j] = the exact distance from SolidWorks' own closest-point query, or null
+        // when the chord pre-filter rules the edge out, so the COM call runs only for nearby edges.
+        // Absent `points`, nothing here runs and the dump is byte-for-byte the historical one.
+        private static void AddOnEdgeDistances(IEdge edge, JObject ej, double[][] points)
+        {
+            double[] a = Vec3(ej["start"]), b = Vec3(ej["end"]), mid = Vec3(ej["mid"]);
+            if (a == null || b == null) return;
+            double chord = Dist3(a, b);
+            // An arc of up to 180 degrees lies within half a chord plus its sagitta of the chord
+            // midpoint; twice the chord also covers ordinary major arcs. Closed edges have no chord.
+            double reach = chord > 1e-9 ? Math.Max(2.0 * chord, 0.02) : 0.2;
+            var dist = new JArray();
+            bool any = false;
+            foreach (var pt in points)
+            {
+                double gap = Math.Min(Dist3(pt, a), Math.Min(Dist3(pt, b), mid != null ? Dist3(pt, mid) : double.MaxValue));
+                double? d = null;
+                if (gap <= reach)
+                {
+                    try
+                    {
+                        var r = edge.GetClosestPointOn(pt[0], pt[1], pt[2]) as double[];
+                        if (r != null && r.Length >= 3) d = R6(Dist3(pt, r));
+                    }
+                    catch { }
+                }
+                if (d.HasValue) { dist.Add(d.Value); any = true; } else dist.Add(JValue.CreateNull());
+            }
+            if (any) ej["on_dist"] = dist;
+        }
+
+        private static double[] Vec3(JToken token)
+        {
+            var arr = token as JArray;
+            if (arr == null || arr.Count < 3) return null;
+            return new[] { arr[0].Value<double>(), arr[1].Value<double>(), arr[2].Value<double>() };
+        }
+
+        private static double Dist3(double[] p, double[] q)
+        {
+            double dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+            return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        private static double[][] ParsePoints(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return null;
+            var parsed = JArray.Parse(json);
+            if (parsed.Count == 0 || parsed.Count > 64) throw new ArgumentException("points must hold 1-64 [x,y,z] entries.");
+            var points = new double[parsed.Count][];
+            for (int i = 0; i < parsed.Count; i++)
+            {
+                points[i] = Vec3(parsed[i]);
+                if (points[i] == null) throw new ArgumentException("points[" + i + "] must be [x,y,z].");
+            }
+            return points;
         }
 
         // Face list with a stable index — the twin of ReadEdges (ADR-027). The `i` matches the same
@@ -1437,7 +1852,10 @@ namespace SolidworksExecution.Services
         private JObject ReadFaces(IPartDoc partDoc, double[] near = null, int k = 0, double[] axis = null)
         {
             var root = new JObject();
-            var facesArr = new JArray();
+            var rankArr = new JArray();
+            var byIndex = new Dictionary<int, FaceFacts>();
+            bool filtering = near != null;
+            double[] axisN = filtering ? NormalizeAxis(axis) : null;
             int idx = 0;
             object[] bodies = partDoc.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
             if (bodies != null)
@@ -1448,35 +1866,64 @@ namespace SolidworksExecution.Services
                     if (body == null) continue;
                     object[] faces = body.GetFaces() as object[];
                     if (faces == null) continue;
-                    foreach (var f in faces)
+                    foreach (var o in faces)
                     {
-                        var face = f as IFace2;
+                        var face = o as IFace2;
                         if (face == null) continue;
-                        facesArr.Add(BuildFaceJson(face, idx++));
+                        if (!filtering)
+                        {
+                            rankArr.Add(BuildFaceJson(face, idx));
+                        }
+                        else
+                        {
+                            // Rank from surface + normal only. A face the direction filter rejects is
+                            // dropped by NarrowByNear whatever else it carries, so neither its
+                            // representative point (GetUVBounds + Evaluate) nor its area is fetched.
+                            var f = FetchFaceSurface(face);
+                            if (f.HavePlanar)
+                            {
+                                FetchFaceNormal(f);
+                                if (axisN == null ||
+                                    AxisAccepts(AssembleFace(f, idx), axisN, FaceNormalDir))
+                                    FetchFacePoint(f);
+                            }
+                            byIndex[idx] = f;
+                            rankArr.Add(AssembleFace(f, idx));
+                        }
+                        idx++;
                     }
                 }
             }
-            ExecLog.Write($"ReadFaces: faces={facesArr.Count} near={(near != null)} k={k}");
-            int totalCount = facesArr.Count;
+            ExecLog.Write($"ReadFaces: faces={rankArr.Count} near={(near != null)} k={k}");
+            int totalCount = rankArr.Count;
 
-            if (near != null)
+            if (!filtering)
             {
-                // The face's representative point is `point`; the axis filter compares the (planar-face)
-                // NORMAL — a non-planar face has no single normal, so it's dropped when an axis is given.
-                var filtered = NarrowByNear(facesArr, near, k, axis, "point",
-                    (fj) => (fj["normal"] as JArray) != null
-                        ? new[] { fj["normal"][0].Value<double>(), fj["normal"][1].Value<double>(), fj["normal"][2].Value<double>() }
-                        : null);
-                root["face_count"] = filtered.Count;
-                root["total_face_count"] = totalCount;
-                root["near"] = new JArray { R6(near[0]), R6(near[1]), R6(near[2]) };
-                if (k > 0) root["k"] = k;
-                if (axis != null) root["axis"] = new JArray { R6(axis[0]), R6(axis[1]), R6(axis[2]) };
-                root["faces"] = filtered;
+                root["face_count"] = totalCount;
+                root["faces"] = rankArr;
                 return root;
             }
-            root["face_count"] = totalCount;
-            root["faces"] = facesArr;
+
+            // The face's representative point is `point`; the axis filter compares the (planar-face)
+            // NORMAL — a non-planar face has no single normal, so it's dropped when an axis is given.
+            var filtered = NarrowByNear(rankArr, near, k, axis, "point", FaceNormalDir);
+            var facesOut = new JArray();
+            foreach (var item in filtered)
+            {
+                var jo = (JObject)item;
+                int i = jo["i"].Value<int>();
+                var f = byIndex[i];
+                FetchFaceArea(f);   // the one key ranking never needed
+                var full = AssembleFace(f, i);
+                full["dist"] = jo["dist"].Value<double>();
+                facesOut.Add(full);
+            }
+            root["face_count"] = facesOut.Count;
+            root["total_face_count"] = totalCount;
+            root["near"] = new JArray { R6(near[0]), R6(near[1]), R6(near[2]) };
+            if (k > 0) root["k"] = k;
+            if (axis != null) root["axis"] = new JArray { R6(axis[0]), R6(axis[1]), R6(axis[2]) };
+            root["faces"] = facesOut;
             return root;
         }
 
@@ -1511,6 +1958,33 @@ namespace SolidworksExecution.Services
             return new[] { dx / L, dy / L, dz / L };
         }
 
+        // Normal direction of a face JSON built by BuildFaceJson; null for a non-planar face (no single normal).
+        private static double[] FaceNormalDir(JObject fj)
+        {
+            return (fj["normal"] as JArray) != null
+                ? new[] { fj["normal"][0].Value<double>(), fj["normal"][1].Value<double>(), fj["normal"][2].Value<double>() }
+                : null;
+        }
+
+        // Unit `axis`, or null when absent/degenerate — null means "no direction filter" for both
+        // NarrowByNear and ReadFaces' pre-filter, so the two always agree on whether to filter at all.
+        private static double[] NormalizeAxis(double[] axis)
+        {
+            if (axis == null) return null;
+            double al = Math.Sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+            return al > 1e-9 ? new[] { axis[0] / al, axis[1] / al, axis[2] / al } : null;
+        }
+
+        // |dot(dir, axisN)| >= 0.999. Shared by NarrowByNear and ReadFaces' pre-filter, which rejects a
+        // face before spending COM calls on its representative point: the two must decide identically,
+        // and both read the ROUNDED direction off the JSON (not the raw doubles) for the same reason.
+        private static bool AxisAccepts(JObject jo, double[] axisN, Func<JObject, double[]> dirOf)
+        {
+            var dir = dirOf(jo);
+            if (dir == null) return false;
+            return Math.Abs(dir[0] * axisN[0] + dir[1] * axisN[1] + dir[2] * axisN[2]) >= 0.999;
+        }
+
         // Keep the k entries of `items` nearest (Euclidean) to `near` — measured from each item's
         // representative point (`ptKey` = "mid" for edges, "point" for faces). Optional `axis`: keep only
         // items whose direction (dirOf) is ~parallel to axis (|dot| ≥ 0.999), so e.g. "the nearest face on
@@ -1520,12 +1994,7 @@ namespace SolidworksExecution.Services
         private static JArray NarrowByNear(JArray items, double[] near, int k, double[] axis,
             string ptKey, Func<JObject, double[]> dirOf)
         {
-            double[] axisN = null;
-            if (axis != null)
-            {
-                double al = Math.Sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
-                if (al > 1e-9) axisN = new[] { axis[0] / al, axis[1] / al, axis[2] / al };
-            }
+            double[] axisN = NormalizeAxis(axis);
             var scored = new List<KeyValuePair<double, JObject>>();
             foreach (var it in items)
             {
@@ -1533,13 +2002,7 @@ namespace SolidworksExecution.Services
                 if (jo == null) continue;
                 var pt = jo[ptKey] as JArray;
                 if (pt == null || pt.Count < 3) continue;
-                if (axisN != null)
-                {
-                    var dir = dirOf(jo);
-                    if (dir == null) continue;
-                    double dot = Math.Abs(dir[0] * axisN[0] + dir[1] * axisN[1] + dir[2] * axisN[2]);
-                    if (dot < 0.999) continue;
-                }
+                if (axisN != null && !AxisAccepts(jo, axisN, dirOf)) continue;
                 double dx = pt[0].Value<double>() - near[0];
                 double dy = pt[1].Value<double>() - near[1];
                 double dz = pt[2].Value<double>() - near[2];

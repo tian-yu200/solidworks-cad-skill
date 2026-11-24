@@ -33,30 +33,113 @@ import math
 from .errors import FeatureError
 
 _UP = (0.0, 1.0, 0.0)   # SolidWorks default "up" axis (+Y). v0-exp binds 'top' to global +Y.
+# 脚踏座 2026-11-02: a bore on a boss's front face was written as a `hole` on 'top' (the only
+# selector), then only its third coordinate was moved — twice, until the build gave up. Say
+# where the axis goes and what to use instead, in the message the model reads.
+HOLE_AXIS_HINT = (" A hole on selector 'top' goes into the body's upward (+Y) face, so it runs "
+                  "along Y. A bore along X or Z (a front/side face, a boss end) is a sketch with a "
+                  "circle on that datum plane (signed offset) plus an extrude with operation 'cut'; "
+                  "that changes the feature sequence, so it takes one user confirmation.")
 _NORMAL_TOL = 0.9       # a face counts as "upward" when normal . up >= this
 _TIE_EPS = 1e-6         # two upward faces this close in height => ambiguous
 _PLANE_TOL = 1e-5       # anchor->plane distance for a face-anchor match (10x the 1µm grid)
 _EDGE_TOL = 1e-4        # anchor->mid distance ball for an edge-anchor match (0.1 mm)
+# Circular-edge (bore mouth) matching. A blind hole contributes TWO identical circles — the
+# mouth and the bottom — separated along the circle's own normal by the cut depth, so a
+# coordinate ball alone can never tell them apart; the MOUTH is the one further along the
+# direction that points OUT of the material at the entry face. These tolerances decide "is this
+# edge the circle I mean": same centre, same axis (sign-insensitive), same radius.
+_BORE_TOL = 1e-4        # centre/radius agreement for a bore-face-derived circle (0.1 mm)
+_AXIS_TOL = 1e-3        # |cos| slack when comparing circle axes
 
 
-def resolve_top_face(port, state_version, node_id=None):
+# ---------------------------------------------------------------------------------------------
+# analyze payload memo (SPEED task A)
+#
+# The geometry a resolver reads is a pure function of (state_version, analysis_type, name,
+# narrowing args): no resolver call mutates the document, so a read taken at state_version N
+# stays valid until something BUMPS state_version. A single feature graph still re-reads the
+# same full faces/edges dump once per resolver call (a fillet with 8 anchors, a hole plus a
+# face anchor, ...), and the production log shows 264 of 463 analyze_model calls repeating a
+# read already taken at the SAME state_version — 2 573 s, 32% of all backend time.
+#
+# Scope is deliberately ONE compile_and_run: `begin_run` clears the memo, the compiler calls
+# `invalidate` whenever an op returns a NEW state_version, and `end_run` clears it again so
+# nothing survives into the next graph (a live run's cache must never leak a stale document).
+# A cached entry is therefore only ever served for the exact state_version it was read at.
+# ---------------------------------------------------------------------------------------------
+class _AnalyzeMemo(object):
+    """Per-run cache of analyze_model/analyze_assembly payloads, keyed by read identity."""
+
+    def __init__(self):
+        self._entries = {}
+
+    def reset(self):
+        self._entries.clear()
+
+    def key(self, tool, state_version, analysis_type, name, narrowing):
+        # `narrowing` is the tool's own narrowing args (near/k/axis/component). Sorted items so
+        # an equal set of args always maps to the same key; JSON keeps lists hashable+comparable.
+        return (
+            tool,
+            state_version,
+            analysis_type,
+            name,
+            json.dumps(narrowing or {}, sort_keys=True, default=str),
+        )
+
+    def get(self, key):
+        return self._entries.get(key)
+
+    def put(self, key, value):
+        self._entries[key] = value
+
+    def invalidate(self, state_version):
+        """Drop every entry not read at `state_version` (a write advanced the document)."""
+        for key in [k for k in self._entries if k[1] != state_version]:
+            del self._entries[key]
+
+    def __len__(self):
+        return len(self._entries)
+
+
+MEMO = _AnalyzeMemo()
+
+
+def begin_run():
+    """Start a compile_and_run scope: nothing from a previous run may be reused."""
+    MEMO.reset()
+
+
+def end_run():
+    """Close the scope so no payload outlives the graph that produced it."""
+    MEMO.reset()
+
+
+def invalidate(state_version):
+    """A write op advanced the document — drop reads taken at any other state_version."""
+    MEMO.invalidate(state_version)
+
+
+HOLE_AMBIGUOUS_TOP_HINT = (
+    " Disambiguate by setting ref.position='point' with ref.at=[x, y, z] (meters) on the "
+    "intended upward face, or build the bore as a circle sketch + extrude with operation 'cut'."
+)
+
+
+def resolve_top_face(port, state_version, node_id=None, at=None):
     """Return (face_index, info) for the semantic 'top' face. Raises FeatureError on
-    REFERENCE_UNRESOLVED (no upward face / analyze failed) or REFERENCE_AMBIGUOUS (a tie)."""
-    resp = port.execute("analyze_model", {"analysis_type": "faces", "name": ""}, state_version)
-    if resp.get("status") != "COMPLETED":
-        err = resp.get("error") or {}
-        raise FeatureError("analyze_model(faces) failed: %s" % err.get("message"),
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
+    REFERENCE_UNRESOLVED (no upward face / analyze failed) or REFERENCE_AMBIGUOUS (a tie).
 
-    feats = (resp.get("cadState") or {}).get("features") or []
-    if not feats:
-        raise FeatureError("analyze_model(faces) returned no face data (is there a solid body?)",
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
-    try:
-        data = json.loads(feats[0])
-    except Exception as ex:
-        raise FeatureError("could not parse analyze_model(faces) payload: %s" % ex,
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
+    When `at` ([x, y, z] model meters, from ref.position='point') is supplied, upward planar
+    faces whose plane contains `at` (within _PLANE_TOL) are selected first and ranked by
+    distance to each face's representative point — resolving equal-height symmetric bosses
+    (H25) as well as stepped upward decks. If `at` lies on no upward face's plane, the highest
+    upward face is returned so check_hole_on_face reports PLACEMENT_OFF_FACE as before.
+
+    Routed through _analyze_payload so it shares the per-run memo (SPEED task A): a hole, an
+    up-to face anchor and an offset sketch on the same body all want this same dump."""
+    data = _analyze_payload(port, state_version, "faces", node_id, "resolve_top_face")
 
     candidates = []  # (centroid_y, face_index, face)
     for f in data.get("faces") or []:
@@ -75,15 +158,55 @@ def resolve_top_face(port, state_version, node_id=None):
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
 
     candidates.sort(key=lambda c: c[0], reverse=True)
+
+    if at is not None and isinstance(at, (list, tuple)) and len(at) >= 3:
+        at_pt = (float(at[0]), float(at[1]), float(at[2]))
+        on_plane = []  # (dist_to_rep, -area, centroid_y, face_index, face)
+        for cy, fi, face in candidates:
+            if fi < 0:
+                continue
+            n = face["normal"]
+            p = face["point"]
+            plane_dist = abs((at_pt[0] - float(p[0])) * float(n[0])
+                             + (at_pt[1] - float(p[1])) * float(n[1])
+                             + (at_pt[2] - float(p[2])) * float(n[2]))
+            if plane_dist <= _PLANE_TOL:
+                rep = (float(p[0]), float(p[1]), float(p[2]))
+                area = float(face.get("area") or 0.0)
+                on_plane.append((_dist3(at_pt, rep), -area, cy, fi, face))
+        if on_plane:
+            on_plane.sort(key=lambda c: (c[0], c[1], c[3]))
+            if len(on_plane) > 1 and abs(on_plane[1][0] - on_plane[0][0]) < _TIE_EPS:
+                tied_pts = [c[4].get("point") for c in on_plane[:4]
+                            if abs(c[0] - on_plane[0][0]) < _TIE_EPS]
+                raise FeatureError(
+                    ("top face is ambiguous at ref.at=%s — %d coplanar upward faces are "
+                     "equidistant (%s)." % (list(at), len(tied_pts), tied_pts))
+                    + HOLE_AMBIGUOUS_TOP_HINT,
+                    code="REFERENCE_AMBIGUOUS", node_id=node_id, step="resolve_top_face")
+            _d, _neg_area, best_y, best_i, best_face = on_plane[0]
+            return best_i, {"face_index": best_i, "centroid_y": best_y,
+                            "point": best_face.get("point"), "face": best_face}
+        # `at` is off every upward face's plane: hand the highest valid face to check_hole_on_face
+        # so the caller gets PLACEMENT_OFF_FACE with the plane height and axis hint.
+        for cy, fi, face in candidates:
+            if fi >= 0:
+                return fi, {"face_index": fi, "centroid_y": cy,
+                            "point": face.get("point"), "face": face}
+
     top_y, top_i, top_face = candidates[0]
     if top_i < 0:
         raise FeatureError("resolved top face has no valid index",
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
     if len(candidates) > 1 and abs(candidates[1][0] - top_y) < _TIE_EPS:
-        raise FeatureError("top face is ambiguous — multiple upward faces at the same height",
-                           code="REFERENCE_AMBIGUOUS", node_id=node_id, step="resolve_top_face")
+        tied = [c[2].get("point") for c in candidates if abs(c[0] - top_y) < _TIE_EPS][:4]
+        raise FeatureError(
+            ("top face is ambiguous — multiple upward faces share height Y=%.6g m (%s)."
+             % (top_y, tied)) + HOLE_AMBIGUOUS_TOP_HINT,
+            code="REFERENCE_AMBIGUOUS", node_id=node_id, step="resolve_top_face")
 
-    return top_i, {"face_index": top_i, "centroid_y": top_y, "point": top_face.get("point")}
+    return top_i, {"face_index": top_i, "centroid_y": top_y, "point": top_face.get("point"),
+                    "face": top_face}
 
 
 def resolve_center_on_face(face_info):
@@ -93,8 +216,18 @@ def resolve_center_on_face(face_info):
 
 
 def _analyze_payload(port, state_version, analysis_type, node_id, step):
-    """Run read-only analyze_model(analysis_type) through the port and parse its JSON payload."""
-    resp = port.execute("analyze_model", {"analysis_type": analysis_type, "name": ""}, state_version)
+    """Run read-only analyze_model(analysis_type) through the port and parse its JSON payload.
+
+    Memoized for the duration of one compile_and_run (SPEED task A): the SAME read at the SAME
+    state_version is issued to the backend once. A write bumps state_version, the compiler calls
+    invalidate(), and the next resolver call re-reads. Errors are never cached — a failed read
+    raises and is retried by the caller's own control flow."""
+    params = {"analysis_type": analysis_type, "name": ""}
+    key = MEMO.key("analyze_model", state_version, analysis_type, "", None)
+    cached = MEMO.get(key)
+    if cached is not None:
+        return cached
+    resp = port.execute("analyze_model", params, state_version)
     if resp.get("status") != "COMPLETED":
         err = resp.get("error") or {}
         raise FeatureError("analyze_model(%s) failed: %s" % (analysis_type, err.get("message")),
@@ -104,14 +237,267 @@ def _analyze_payload(port, state_version, analysis_type, node_id, step):
         raise FeatureError("analyze_model(%s) returned no data (is there a solid body?)" % analysis_type,
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
     try:
-        return json.loads(feats[0])
+        data = json.loads(feats[0])
     except Exception as ex:
         raise FeatureError("could not parse analyze_model(%s) payload: %s" % (analysis_type, ex),
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    MEMO.put(key, data)
+    return data
 
 
 def _dist3(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def _flat_analyze_lines(resp):
+    """The `key=value` STRINGS an analyze_model scope returns (geometry / mass_properties).
+    Those scopes do not emit a JSON object: the C# side appends plain "bbox_min=[x,y,z]"-style
+    rows to a List<string>, so `_analyze_payload` (which json.loads) cannot read them."""
+    feats = (resp.get("cadState") or {}).get("features") or []
+    return [f for f in feats if isinstance(f, str)]
+
+
+def _parse_vec(text):
+    """'[1,2,3]' -> (1.0, 2.0, 3.0), or None when the row is not a 3-vector."""
+    try:
+        body = text.strip()
+        if not (body.startswith("[") and body.endswith("]")):
+            return None
+        parts = [p for p in body[1:-1].split(",") if p.strip()]
+        if len(parts) != 3:
+            return None
+        return tuple(float(p) for p in parts)
+    except (TypeError, ValueError):
+        return None
+
+
+def body_bbox(port, state_version, node_id=None):
+    """(bbox_min, bbox_max) of the solid bodies, in MODEL metres, or None.
+
+    Read from analyze_model(geometry) — the same call AddBoundingBoxResults feeds — because the
+    hole-placement breakout test needs the part's REAL extent, not the face's area. A planar
+    face's payload carries only a representative point, a normal and an area, so a hole hanging
+    off the edge of a large face is invisible to an area test (that was review defect D1). The
+    bbox is exact for the axis-aligned plate faces these drawings use; it is a bounding box, so
+    for a face that is NOT the whole silhouette it stays a necessary-condition test and the
+    post-cut circle check (compiler.py) is what closes the gap.
+
+    Memoized like every other analyze read, so a graph with many holes pays for it once.
+    """
+    key = MEMO.key("analyze_model", state_version, "geometry_bbox", "", None)
+    cached = MEMO.get(key)
+    if cached is not None:
+        return cached if cached is not False else None
+    try:
+        resp = port.execute("analyze_model",
+                            {"analysis_type": "geometry", "name": ""}, state_version)
+    except Exception:
+        resp = None
+    lo = hi = None
+    if isinstance(resp, dict) and resp.get("status") == "COMPLETED":
+        for line in _flat_analyze_lines(resp):
+            if "=" not in line:
+                continue
+            name, _sep, value = line.partition("=")
+            if name.strip() == "bbox_min":
+                lo = _parse_vec(value)
+            elif name.strip() == "bbox_max":
+                hi = _parse_vec(value)
+    result = (lo, hi) if lo is not None and hi is not None else False
+    MEMO.put(key, result)
+    return result if result is not False else None
+
+
+def check_hole_inside_extent(at, face, diameter, bbox, node_id=None):
+    """D1: reject a hole whose CIRCLE leaves the part's real extent, measured on the FACE PLANE.
+
+    `bbox` is (min, max) model-space corners from body_bbox(). The circle is projected onto the
+    face's two in-plane axes, and its extremes are compared with the body's extent along those
+    same axes. This is what an area test cannot do: on a 60x40 plate the extent is 60 x 40 mm, so
+    a d6.6 hole at x=+29.5 (edge at 30) is rejected, while the four corner holes at +-22
+    (22 + 3.3 = 25.3 < 30) pass — the case the equal-area square got exactly backwards.
+
+    Returns True when the hole is inside (or when there is nothing to measure against), and
+    raises PLACEMENT_BREAKS_OUT when it is not.
+    """
+    if not bbox:
+        return True
+    normal = face.get("normal")
+    if not (isinstance(normal, list) and len(normal) >= 3):
+        return True
+    n = _unit((float(normal[0]), float(normal[1]), float(normal[2])))
+    if n is None:
+        return True
+    # Two in-plane axes: any orthonormal pair works because the bbox is axis-aligned, so project
+    # the bbox onto each in-plane axis and take the circle's extremes along it.
+    u_axis = _any_perpendicular(n)
+    v_axis = _cross(n, u_axis)
+    lo, hi = bbox
+    radius = float(diameter) / 2.0
+    for axis in (u_axis, v_axis):
+        centre = _dot3(at, axis)
+        low = min(_dot3(lo, axis), _dot3(hi, axis))
+        high = max(_dot3(lo, axis), _dot3(hi, axis))
+        if centre - radius < low - _PLANE_TOL or centre + radius > high + _PLANE_TOL:
+            raise FeatureError(
+                "hole breaks out of the part: a d%s mm circle at %s leaves the body extent "
+                "[%s, %s] along the face axis %s (the circle needs %.6g m to %.6g m there). "
+                "Move ref.at inward, or use a smaller diameter."
+                % (_mm(float(diameter)), list(at), _mm(low), _mm(high), list(axis),
+                   centre - radius, centre + radius),
+                code="PLACEMENT_BREAKS_OUT", node_id=node_id,
+                step="check_hole_inside_extent")
+    return True
+
+
+def _mm(value):
+    return "%.4g" % (float(value) * 1000.0)
+
+
+def _dot3(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(v):
+    length = math.sqrt(_dot3(v, v))
+    if length <= 1e-12:
+        return None
+    return (v[0] / length, v[1] / length, v[2] / length)
+
+
+def _any_perpendicular(n):
+    """A unit vector perpendicular to unit `n` (pick the least-aligned model axis)."""
+    candidates = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    pick = min(candidates, key=lambda c: abs(_dot3(c, n)))
+    perp = _cross(n, pick)
+    return _unit(perp) or (0.0, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------------------------
+# Off-centre hole placement (batch 10a)
+#
+# A hole used to land at its face's centre, because resolve_center_on_face returns (0, 0) — the
+# sketch frame's ORIGIN is the face's representative point. `ref.position: 'point'` + `ref.at`
+# names a MODEL-space point instead. The mapping needs the FACE SKETCH's own frame, which is only
+# measured once create_sketch has run (its result_geometry.frame, the same reader analyze uses),
+# so the compiler defers this call to that moment — see compiler._place_hole_2d.
+#
+# Why model space and not sketch space: a drawing gives absolute dimensions off the part's datum
+# edges, and every other anchor in this IR (face_anchor, edge_anchor, up_to) is already model
+# space. Sketch space would force the author to know the face sketch's in-plane axes, which is
+# exactly the guesswork the datum-frame table had to document. The compiler knows the frame, so
+# the author does not have to.
+# ---------------------------------------------------------------------------------------------
+
+def _frame_axes(frame):
+    """(origin, xdir, ydir) as float 3-tuples, or None when the frame is unusable."""
+    if not isinstance(frame, dict):
+        return None
+    out = []
+    for key in ("origin", "xdir", "ydir"):
+        v = frame.get(key)
+        if not (isinstance(v, list) and len(v) >= 3
+                and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in v[:3])):
+            return None
+        out.append((float(v[0]), float(v[1]), float(v[2])))
+    return tuple(out)
+
+
+def project_point_into_frame(frame, at):
+    """MODEL point -> (u, v) in the face sketch's 2-D frame, plus the out-of-plane distance.
+
+    The sketch frame is orthonormal (SolidWorks builds it from the face's plane), so the map is
+    the two dot products (at - origin) . xdir and . ydir. The third component is how far the
+    point sits off the sketch plane — the caller rejects a non-zero value, which is what makes
+    "the point must lie on the referenced face" a real check instead of a comment.
+    """
+    axes = _frame_axes(frame)
+    if axes is None:
+        raise FeatureError(
+            "the face sketch frame is missing or malformed (need origin/xdir/ydir), so an "
+            "off-centre hole cannot be placed deterministically.",
+            code="REFERENCE_UNRESOLVED", step="project_point_into_frame")
+    origin, xdir, ydir = axes
+    d = (float(at[0]) - origin[0], float(at[1]) - origin[1], float(at[2]) - origin[2])
+    u = d[0] * xdir[0] + d[1] * xdir[1] + d[2] * xdir[2]
+    v = d[0] * ydir[0] + d[1] * ydir[1] + d[2] * ydir[2]
+    # Residual along the frame's own normal (xdir x ydir) — the off-plane distance.
+    n = (xdir[1] * ydir[2] - xdir[2] * ydir[1],
+         xdir[2] * ydir[0] - xdir[0] * ydir[2],
+         xdir[0] * ydir[1] - xdir[1] * ydir[0])
+    off_plane = d[0] * n[0] + d[1] * n[1] + d[2] * n[2]
+    return u, v, off_plane
+
+
+def check_hole_on_face(at, face, diameter, node_id=None):
+    """Plan-time checks that need only the resolved FACE (no sketch frame yet).
+
+    ONE failure is catchable here: the point is not on the face's plane (a typo in the
+    third coordinate would otherwise silently cut a hole somewhere the author never named).
+    The breakout test is NOT here: it needs the part's real extent, so it lives in
+    check_hole_inside_extent(bbox), which projects the body bbox onto this face's plane.
+    An earlier version compared radius against sqrt(area)/2 and ignored `at` entirely, so a
+    hole hanging off the edge of a large face passed.
+    """
+    normal = face.get("normal")
+    point = face.get("point")
+    if not (isinstance(normal, list) and len(normal) >= 3
+            and isinstance(point, list) and len(point) >= 3):
+        return  # no plane data reported: nothing to check against (resolver already matched)
+    n = (float(normal[0]), float(normal[1]), float(normal[2]))
+    d = (float(at[0]) - float(point[0]), float(at[1]) - float(point[1]),
+         float(at[2]) - float(point[2]))
+    off = abs(d[0] * n[0] + d[1] * n[1] + d[2] * n[2])
+    if off > _PLANE_TOL:
+        raise FeatureError(
+            ("hole placement point %s is %.6g m OFF the referenced face's plane (tolerance "
+             "%g m). The point must lie ON the face — read analyze_model(faces) `point`/`normal` "
+             "for that face and move the third coordinate onto it."
+             % (list(at), off, _PLANE_TOL)) + HOLE_AXIS_HINT,
+            code="PLACEMENT_OFF_FACE", node_id=node_id, step="check_hole_on_face")
+
+
+def _face_label(face_key):
+    """Human-readable face identity for messages: ('n1', 0) -> "n1 face #0".
+    The key is (BODY node id, face index) because face indices are per-body."""
+    if isinstance(face_key, tuple) and len(face_key) == 2:
+        return "%s face #%s" % (face_key[0], face_key[1])
+    return "face #%s" % (face_key,)
+
+
+def check_holes_do_not_overlap(placements, node_id=None):
+    """Reject two holes on the SAME face whose circles overlap (batch 10a).
+
+    `placements` is [(node_id, face_index, centre_uv, diameter)] for EVERY hole in the graph,
+    in node order — centred holes included (a centred hole cuts a real circle too).
+    `centre_uv` is the hole's centre in the FACE SKETCH's 2-D frame, so the comparison never
+    depends on how each hole was placed: an off-centre hole contributes its mapped (u, v), a
+    centred one the sketch origin (0, 0). Only holes on the same face are compared: two holes at
+    the same (x, z) on OPPOSITE faces of a plate are perfectly legal. Circle-vs-circle in that
+    shared 2-D frame is exact, since the frame is orthonormal (distances are preserved).
+    """
+    for i in range(len(placements)):
+        for j in range(i + 1, len(placements)):
+            a_id, a_face, a_uv, a_dia = placements[i]
+            b_id, b_face, b_uv, b_dia = placements[j]
+            if a_face != b_face:
+                continue
+            gap = math.hypot(a_uv[0] - b_uv[0], a_uv[1] - b_uv[1])
+            need = (float(a_dia) + float(b_dia)) / 2.0
+            if gap < need - 1e-9:
+                raise FeatureError(
+                    "holes '%s' and '%s' OVERLAP on %s: centres are %.6g m apart but "
+                    "their radii need %.6g m. Move one of them."
+                    % (a_id, b_id, _face_label(a_face), gap, need),
+                    code="PLACEMENT_OVERLAP", node_id=node_id,
+                    step="check_holes_do_not_overlap")
+
 
 
 def resolve_face_by_anchor(port, state_version, near, node_id=None):
@@ -197,9 +583,17 @@ def resolve_face_on_plane(port, state_version, datum, offset, node_id=None):
 
 
 def _analyze_assembly_payload(port, state_version, analysis_type, component, node_id, step):
-    """Run read-only analyze_assembly(analysis_type, component) and parse its JSON payload."""
-    resp = port.execute("analyze_assembly",
-                        {"analysis_type": analysis_type, "component": component}, state_version)
+    """Run read-only analyze_assembly(analysis_type, component) and parse its JSON payload.
+
+    Memoized per (component, analysis_type, state_version) for the duration of ONE
+    compile_and_run (SPEED task A) — a mate graph resolves several anchors on the same
+    component at the same state_version and used to re-read the same dump each time."""
+    params = {"analysis_type": analysis_type, "component": component}
+    key = MEMO.key("analyze_assembly", state_version, analysis_type, component, None)
+    cached = MEMO.get(key)
+    if cached is not None:
+        return cached
+    resp = port.execute("analyze_assembly", params, state_version)
     if resp.get("status") != "COMPLETED":
         err = resp.get("error") or {}
         raise FeatureError("analyze_assembly(%s, %s) failed: %s"
@@ -210,10 +604,12 @@ def _analyze_assembly_payload(port, state_version, analysis_type, component, nod
         raise FeatureError("analyze_assembly(%s, %s) returned no data" % (analysis_type, component),
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
     try:
-        return json.loads(feats[0])
+        data = json.loads(feats[0])
     except Exception as ex:
         raise FeatureError("could not parse analyze_assembly(%s) payload: %s" % (analysis_type, ex),
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    MEMO.put(key, data)
+    return data
 
 
 _FACE_ANCHOR_KINDS = frozenset(("plane", "cylinder", "cone", "sphere"))
@@ -343,40 +739,197 @@ def _is_num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _point3(value):
+    return isinstance(value, list) and len(value) >= 3 and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) for v in value[:3])
+
+
+def _edge_distance(near, edge):
+    """Distance from an anchor to the edge curve itself, as far as the readback describes it.
+
+    A closed circle carries center/normal/radius: the distance combines the offset along its axis
+    with the radial miss. An open edge carries start/end: the distance to that segment is exact for
+    a line (for an arc it is the chord, so arcs still resolve best through their midpoint).
+    Returns None when the readback has no usable curve description.
+    """
+    if edge.get("kind") == "circle" and _point3(edge.get("center")) and _point3(edge.get("normal")) \
+            and isinstance(edge.get("radius"), (int, float)):
+        c, n, r = edge["center"], edge["normal"], float(edge["radius"])
+        length = math.sqrt(sum(v * v for v in n[:3]))
+        if length > 0:
+            v = [near[i] - c[i] for i in range(3)]
+            axial = sum(v[i] * n[i] for i in range(3)) / length
+            radial = math.sqrt(max(sum(x * x for x in v) - axial * axial, 0.0))
+            return math.hypot(axial, radial - r)
+    a, b = edge.get("start"), edge.get("end")
+    if _point3(a) and _point3(b):
+        ab = [b[i] - a[i] for i in range(3)]
+        span = sum(x * x for x in ab)
+        if span > 1e-18:
+            t = max(0.0, min(1.0, sum((near[i] - a[i]) * ab[i] for i in range(3)) / span))
+            return _dist3(near, [a[i] + t * ab[i] for i in range(3)])
+    return None
+
+
+def _on_edge_distances(port, state_version, points, node_id, step):
+    """Exact point->edge distances from the execution layer for points the cheap rules could not
+    place. Returns [(edge_index, [d_or_None per point])] for edges that report on_dist; an older
+    layer without the opt-in `points` reports none, which leaves those anchors unresolved."""
+    params = {"analysis_type": "edges", "name": "",
+              "points": json.dumps([[float(v) for v in p[:3]] for p in points])}
+    resp = port.execute("analyze_model", params, state_version)
+    if resp.get("status") != "COMPLETED":
+        err = resp.get("error") or {}
+        raise FeatureError("analyze_model(edges, points) failed: %s" % err.get("message"),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    rows = []
+    for feat in (resp.get("cadState") or {}).get("features") or []:
+        try:
+            payload = json.loads(feat) if isinstance(feat, str) else feat
+        except ValueError:
+            continue
+        for e in (payload or {}).get("edges") or []:
+            dist = e.get("on_dist")
+            if isinstance(dist, list) and len(dist) == len(points):
+                rows.append((int(e.get("i", -1)),
+                             [d if isinstance(d, (int, float)) and not isinstance(d, bool) else None
+                              for d in dist]))
+    return rows
+
+
+def _fmt3(p):
+    return "[%s]" % ", ".join("%.6g" % (round(float(v), 9) + 0.0) for v in p[:3])
+
+
+def _circle_point(edge, toward, away=False):
+    """The point of a full-circle edge nearest `toward` (or diametrically across from it)."""
+    c, n, r = edge["center"], edge["normal"], float(edge["radius"])
+    length = math.sqrt(sum(v * v for v in n[:3])) or 1.0
+    n = [v / length for v in n[:3]]
+    v = [toward[i] - c[i] for i in range(3)]
+    axial = sum(v[i] * n[i] for i in range(3))
+    u = [v[i] - axial * n[i] for i in range(3)]
+    size = math.sqrt(sum(x * x for x in u))
+    if size <= 1e-12:  # anchor on the axis: any radial direction will do
+        seed = [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0]
+        dot = sum(seed[i] * n[i] for i in range(3))
+        u = [seed[i] - dot * n[i] for i in range(3)]
+        size = math.sqrt(sum(x * x for x in u))
+    sign = -1.0 if away else 1.0
+    return [c[i] + sign * r * u[i] / size for i in range(3)]
+
+
+def _edge_label(i, edge, near, away=False):
+    """One readback edge as a model can re-anchor on it: what it is, and a point inside it.
+
+    2026-11-02 (脚踏座): three chamfer repairs in a row guessed at a rim from "nearest was 0.006 m
+    away" alone and spent the whole repair budget; the rim was on the other end of the boss.
+    """
+    if edge.get("kind") == "circle" and _point3(edge.get("center")) and _point3(edge.get("normal")) \
+            and isinstance(edge.get("radius"), (int, float)):
+        return "#%d circle R%.6g centre %s axis %s, use near %s" % (
+            i, edge["radius"], _fmt3(edge["center"]), _fmt3(edge["normal"]),
+            _fmt3(_circle_point(edge, near, away)))
+    a, b, m = edge.get("start"), edge.get("end"), edge.get("mid")
+    inside = m if _point3(m) else ([(a[k] + b[k]) / 2.0 for k in range(3)]
+                                   if _point3(a) and _point3(b) else None)
+    if _point3(a) and _point3(b) and inside is not None:
+        return "#%d edge %s to %s, use near %s" % (i, _fmt3(a), _fmt3(b), _fmt3(inside))
+    return "#%d edge, use near %s" % (i, _fmt3(inside)) if inside is not None else "#%d edge" % i
+
+
+def _edge_candidates(near, edges, ranked, away=False, limit=3):
+    """' Candidates: …' for an error message — the edges in `ranked` order, at most `limit`."""
+    rows = dict(edges)
+    labels = [_edge_label(i, rows[i], near, away) for i in ranked[:limit] if i in rows]
+    return (" Candidates: " + "; ".join(labels) + ".") if labels else ""
+
+
 def resolve_edges_by_anchor(port, state_version, anchors, node_id=None):
     """Edge anchors -> edge indices (for add_edge_feature edge_indices).
 
-    ONE analyze_model(edges) read serves all anchors. Per anchor: edges whose MID lies within
-    the _EDGE_TOL ball around 'near' — exactly one => matched; zero => REFERENCE_UNRESOLVED;
-    more than one => REFERENCE_AMBIGUOUS. Two anchors matching the SAME edge is an error too
-    (duplicate anchor). anchors: iterable of {near: [x,y,z], hint?: str} (hint is never read)."""
+    ONE analyze_model(edges) read serves all anchors. Per anchor, first the original rule: edges
+    whose MID lies within the _EDGE_TOL ball around 'near' — exactly one => matched; more than one
+    => REFERENCE_AMBIGUOUS. Only when NO midpoint is in the ball does the anchor fall back to lying
+    ON an edge (_edge_distance): a full circle's reported midpoint is an arbitrary point of it, and
+    a boolean union splits straight edges and moves their midpoints, so a model can only know a
+    point on the edge, not SolidWorks' midpoint (measured 2026-10-31: a C1 chamfer anchored at the
+    rim's +X point failed with the reported mid 26.6 mm away). On-edge matches: one => matched;
+    several (an anchor at a shared vertex) => REFERENCE_AMBIGUOUS; none => REFERENCE_UNRESOLVED.
+    Two anchors matching the SAME edge is an error too (duplicate anchor).
+    anchors: iterable of {near: [x,y,z], hint?: str} (hint is never read)."""
     step = "resolve_edges_by_anchor"
     data = _analyze_payload(port, state_version, "edges", node_id, step)
 
     mids = []  # (edge_index, mid)
+    edges = []  # (edge_index, readback row)
     for e in data.get("edges") or []:
         m = e.get("mid")
         if isinstance(m, list) and len(m) >= 3:
             mids.append((int(e.get("i", -1)), m))
+        edges.append((int(e.get("i", -1)), e))
     if not mids:
         raise FeatureError("analyze_model(edges) reported no edge midpoints",
                            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
 
-    resolved = []
-    taken = {}
+    def on_edge_ambiguous(k, near, matched):
+        # The point each candidate offers is on the far side of a circle from the anchor (the
+        # anchor sits where edges meet) and an edge's own midpoint otherwise.
+        return FeatureError("edge anchor %d %s lies on %d edges within %g m — ambiguous; "
+                            "anchor an interior point of one edge, not a shared vertex.%s"
+                            % (k, list(near), len(matched), _EDGE_TOL,
+                               _edge_candidates(near, edges, [i for _d, i in matched], away=True)),
+                            code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
+
+    hits = {}      # anchor index -> edge index
+    pending = []   # anchor indices no midpoint, segment or full circle could place
     for k, anchor in enumerate(anchors):
         near = anchor["near"]
         in_ball = [(d, i) for (i, m) in mids for d in (_dist3(near, m),) if d <= _EDGE_TOL]
-        if not in_ball:
-            nearest = min(_dist3(near, m) for (_i, m) in mids)
-            raise FeatureError("edge anchor %d %s matched no edge midpoint within %g m "
-                               "(nearest was %.6f m away)" % (k, list(near), _EDGE_TOL, nearest),
-                               code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
         if len(in_ball) > 1:
-            raise FeatureError("edge anchor %d %s matched %d edge midpoints within %g m — ambiguous"
-                               % (k, list(near), len(in_ball), _EDGE_TOL),
+            raise FeatureError("edge anchor %d %s matched %d edge midpoints within %g m — ambiguous.%s"
+                               % (k, list(near), len(in_ball), _EDGE_TOL,
+                                  _edge_candidates(near, edges, [i for _d, i in in_ball], away=True)),
                                code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
-        idx = in_ball[0][1]
+        if not in_ball:
+            in_ball = [(d, i) for (i, e) in edges for d in (_edge_distance(near, e),)
+                       if d is not None and d <= _EDGE_TOL]
+            if len(in_ball) > 1:
+                raise on_edge_ambiguous(k, near, in_ball)
+        if in_ball:
+            hits[k] = in_ball[0][1]
+        else:
+            pending.append(k)
+
+    if pending:
+        # Points on open arcs, splines or intersection curves: ask SolidWorks for the exact distance
+        # (opt-in `points`; a layer without it simply returns no on_dist and the anchor stays unplaced).
+        exact = _on_edge_distances(port, state_version, [anchors[k]["near"] for k in pending],
+                                   node_id, step)
+        for j, k in enumerate(pending):
+            near = anchors[k]["near"]
+            on_edge = [(row[j], i) for (i, row) in exact if row[j] is not None and row[j] <= _EDGE_TOL]
+            if len(on_edge) > 1:
+                raise on_edge_ambiguous(k, near, on_edge)
+            if not on_edge:
+                best = {}  # edge index -> the smallest distance any rule measured to it
+                for i, d in ([(i, _dist3(near, m)) for (i, m) in mids]
+                             + [(i, _edge_distance(near, e)) for (i, e) in edges]
+                             + [(i, row[j]) for (i, row) in exact]):
+                    if d is not None:
+                        best[i] = min(d, best.get(i, d))
+                ranked = sorted(best, key=best.get)
+                raise FeatureError("edge anchor %d %s lies on no edge and matched no edge midpoint "
+                                   "within %g m (nearest was %.6f m away).%s"
+                                   % (k, list(near), _EDGE_TOL, best[ranked[0]],
+                                      _edge_candidates(near, edges, ranked)),
+                                   code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+            hits[k] = on_edge[0][1]
+
+    resolved = []
+    taken = {}
+    for k in range(len(anchors)):
+        idx = hits[k]
         if idx < 0:
             raise FeatureError("edge anchor %d resolved to an edge with no valid index" % k,
                                code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
@@ -387,3 +940,278 @@ def resolve_edges_by_anchor(port, state_version, anchors, node_id=None):
         taken[idx] = k
         resolved.append(idx)
     return resolved, {"edge_indices": resolved}
+
+
+# ---------------------------------------------------------------------------------------------
+# Thread edge (v0.9.0) — the CIRCULAR edge at a bore MOUTH
+#
+# A cosmetic thread attaches to the circular edge at the mouth of a bore. analyze_model(edges)
+# tags ONLY closed full-circle edges with kind/center/normal/radius (a partial arc, a line and a
+# spline carry none), so the candidate set is exactly "edges that report kind == 'circle'".
+#
+# THE AMBIGUITY THAT MATTERS: a blind hole has TWO identical circles — the mouth and the bottom —
+# with the same axis and the same radius, separated along the axis by the cut depth. A coordinate
+# ball cannot tell them apart, and picking the wrong one threads the bottom of the hole. The
+# MOUTH is the one whose centre lies furthest along the direction pointing OUT of the material
+# at the entry face; for a bore cut into a top face (face normal +Z) that is the larger centre.z.
+# So every path below ends in one shared mouth rule, and a wrong-end pick is impossible by
+# construction. A through hole's two circles are its two mouths, so either is valid — the
+# extreme is still deterministic, which is what matters for reproducibility.
+# ---------------------------------------------------------------------------------------------
+
+def _circle_edges(data):
+    """[(edge_index, center, normal, radius)] for the edges the reader tagged kind='circle'."""
+    out = []
+    for e in data.get("edges") or []:
+        if e.get("kind") != "circle":
+            continue
+        c, n, r = e.get("center"), e.get("normal"), e.get("radius")
+        if not (isinstance(c, list) and len(c) >= 3 and isinstance(n, list) and len(n) >= 3
+                and _is_num(r)):
+            continue
+        out.append((int(e.get("i", -1)), c, n, float(r)))
+    return out
+
+
+def _body_centroid(port, state_version, node_id, step):
+    """The largest solid body's centroid — a point INSIDE the material. None if unavailable.
+
+    Used to orient a bore's axis: the MOUTH is the end further from the material's interior, so
+    "furthest from the centroid along the axis" needs no guess about the sign of a circle's
+    normal (the reader reports the curve's own axis, and its sign is arbitrary).
+
+    Read from analyze_model(bodies), which reports `centroid` per body — NOT from
+    mass_properties, whose payload is a list of "cx=.." STRINGS rather than JSON numbers. The
+    largest body by volume wins (a multibody part's thread belongs to the part, not a scrap).
+    Read-only and memoized like every other analyze read.
+    """
+    try:
+        data = _analyze_payload(port, state_version, "bodies", node_id, step)
+    except FeatureError:
+        return None
+    best = None
+    for body in data.get("bodies") or []:
+        c = body.get("centroid")
+        if not (isinstance(c, list) and len(c) >= 3 and all(_is_num(x) for x in c[:3])):
+            continue
+        vol = body.get("volume")
+        score = float(vol) if _is_num(vol) else 0.0
+        if best is None or score > best[0]:
+            best = (score, [float(x) for x in c[:3]])
+    return None if best is None else best[1]
+
+
+def _axial_rank(center, axis, reference):
+    """How far a circle's centre lies from `reference`, measured ALONG the bore axis.
+
+    This is an UNSIGNED distance on purpose. The caller always supplies the reference it means
+    and then sorts in the direction it means:
+
+      * entry_point  -> sort ASCENDING  (nearest the entry face = the mouth)
+      * interior     -> sort DESCENDING (furthest from inside the material = the mouth)
+
+    Do NOT read a direction into the number: `axis` is the circle's own reported normal and its
+    SIGN is arbitrary (SolidWorks reports the curve's axis, not an outward one), so any signed
+    reading would flip with the reader's choice of normal. A plain distance cannot.
+    """
+    d = [center[i] - reference[i] for i in range(3)]
+    t = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2]
+    return abs(t)
+
+
+def _pick_mouth(candidates, interior, axis_hint, node_id, step, what, entry_point=None,
+                 tie_is_one_bore=False):
+    """The bore MOUTH circle among `candidates` — deterministic, never ambiguous for one bore.
+
+    `candidates` is [(index, center, normal, radius)]. Two rules, in order:
+
+      1. ENTRY SIDE (authoritative when `entry_point` is known). The thread starts at the face
+         the bore was entered from, so the mouth is the circle whose centre is nearest that
+         point along the bore axis. This is the ONLY rule that can separate a THROUGH bore's two
+         identical end circles: they sit at the SAME distance from the material's interior
+         (that is what "through" means), so the interior rule ties on them by construction and
+         raising ambiguity there would block every through thread — M42x2/M40x2 included.
+      2. INTERIOR (fallback when there is no entry point). The circle FURTHEST from a point
+         inside the material: a blind bore's bottom is closer to the interior than its mouth.
+
+    A tie is only reported when NEITHER rule can order the candidates — two circles the same
+    distance from the interior AND the same distance from the entry point, which means two
+    genuinely different bores.
+    """
+    if not candidates:
+        raise FeatureError("%s: no circular edge candidates" % what,
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    axis = axis_hint or candidates[0][2]
+
+    def _rank(entry):
+        return sorted(((_axial_rank(c, axis, entry), i, c, n, r) for (i, c, n, r) in candidates),
+                      key=lambda t: t[0])
+
+    if entry_point is not None:
+        ranked = _rank(entry_point)          # nearest the entry face wins
+        if len(ranked) == 1 or abs(ranked[0][0] - ranked[1][0]) > _BORE_TOL:
+            return ranked[0]
+        # The two ends are equidistant from the entry point too (a symmetric bore): fall
+        # through to the interior rule, which can still order a blind bore.
+
+    if interior is None:
+        # No centroid: the midpoint of the candidate centres stands in for "inside".
+        interior = [sum(c[i] for (_x, c, _n, _r) in candidates) / float(len(candidates))
+                    for i in range(3)]
+    ranked = _rank(interior)
+    ranked.reverse()                          # furthest from the interior wins
+    if tie_is_one_bore and len(ranked) > 1 and abs(ranked[0][0] - ranked[1][0]) <= _BORE_TOL:
+        # Both ends of the SAME bore (same axis, same radius — the caller built the candidate
+        # set that way). Deterministic and honest: the lowest edge index wins, so the same
+        # graph always threads the same end and a rebuild is reproducible.
+        return min(ranked, key=lambda t: t[1])
+    if len(ranked) > 1 and abs(ranked[0][0] - ranked[1][0]) <= _BORE_TOL:
+        raise FeatureError(
+            "%s: %d circular edges are the same distance from both the entry point and the "
+            "material's interior (%s) — they are two different bores, not the two ends of one. "
+            "Anchor the mouth circle's CENTRE with ref.edge_anchor instead of ref.bore_face."
+            % (what, len(ranked), ", ".join("#%d" % t[1] for t in ranked[:4])),
+            code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
+    return ranked[0]
+
+
+def resolve_thread_edge(port, state_version, ref, node_id=None):
+    """A thread ref -> (edge_index, info) for the bore MOUTH circle.
+
+    Two anchor kinds, both validated structurally before they get here:
+
+      ref.edge_anchor {near}      `near` is the mouth circle's CENTRE (the reader reports it as
+                                  `center` for kind='circle'). A circle's `mid` is one arbitrary
+                                  point on its circumference, so a mid-ball test would depend on
+                                  where the reader happened to sample — hence the centre.
+      ref.bore_face {near, radius?}
+                                  a point ON the cylindrical face; from it, the circles sharing
+                                  that axis and radius, then the mouth rule.
+
+    Both paths end in the same mouth rule. Raises REFERENCE_UNRESOLVED / REFERENCE_AMBIGUOUS —
+    the same codes the rest of the resolver uses, so the failure surface does not grow.
+    """
+    step = "resolve_thread_edge"
+    edges = _analyze_payload(port, state_version, "edges", node_id, step)
+    circles = _circle_edges(edges)
+    if not circles:
+        raise FeatureError(
+            "analyze_model(edges) reported no circular edges (kind='circle') — a cosmetic "
+            "thread needs the CIRCULAR edge at a bore mouth. Does this build report circle "
+            "descriptors, and does the part actually contain a bore?",
+            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+
+    edge_anchor = ref.get("edge_anchor")
+    if edge_anchor is not None:
+        near = edge_anchor["near"]
+        want_radius = edge_anchor.get("radius")
+        # RADIUS IS A DISAMBIGUATOR, not an axis filter. A revolve end face carries the bore
+        # mouth AND an outer rim as CONCENTRIC COPLANAR circles; a counterbored hole carries the
+        # pilot mouth and the counterbore-floor rim the same way. Their centres are identical, so
+        # only the radius separates them.
+        pool = circles
+        if want_radius is not None:
+            pool = [c for c in circles if abs(c[3] - float(want_radius)) <= _BORE_TOL]
+            if not pool:
+                raise FeatureError(
+                    "ref.edge_anchor %s asks for a circle of radius %g m and no circular edge "
+                    "matches it (radii present: %s)."
+                    % (list(near), float(want_radius),
+                       ", ".join("%g" % c[3] for c in circles[:8])),
+                    code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+        near_c = [(_dist3(near, c), i, c, n, r) for (i, c, n, r) in pool]
+        near_c.sort(key=lambda t: t[0])
+        best = near_c[0]
+        if best[0] > _EDGE_TOL:
+            raise FeatureError(
+                "ref.edge_anchor %s matched no circular-edge CENTRE within %g m (nearest was "
+                "#%d at %.6f m). The anchor names the mouth circle's CENTRE (analyze_model"
+                "(edges) reports it as `center` for kind='circle'), not a point on the rim."
+                % (list(near), _EDGE_TOL, best[1], best[0]),
+                code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+        # Same centre, opposite ends of a bore (a blind bore's bottom, or a through bore's far
+        # end). Break the tie by the mouth rule with the anchor as the ENTRY reference: the
+        # anchor names the mouth, so the end nearest it is the mouth — and for a through bore,
+        # whose two ends are equidistant from the material's interior, this is the ONLY rule
+        # that can decide. Never raise for the two ends of one bore.
+        tied = [t for t in near_c if abs(t[0] - best[0]) <= _BORE_TOL]
+        if len(tied) == 1:
+            return best[1], {"edge_index": best[1], "edge_center": best[2],
+                             "edge_normal": best[3], "edge_radius": best[4],
+                             "matched": "edge_anchor"}
+        interior = _body_centroid(port, state_version, node_id, step)
+        _rank, idx, center, normal, radius = _pick_mouth(
+            [(t[1], t[2], t[3], t[4]) for t in tied], interior, best[3], node_id, step,
+            "ref.edge_anchor %s" % list(near),
+            entry_point=near)
+        return idx, {"edge_index": idx, "edge_center": center, "edge_normal": normal,
+                     "edge_radius": radius, "matched": "edge_anchor (mouth rule)"}
+
+    bore_face = ref["bore_face"]
+    near = bore_face["near"]
+    want_radius = bore_face.get("radius")
+    faces = _analyze_payload(port, state_version, "faces", node_id, step)
+
+    cylinders = []
+    for f in faces.get("faces") or []:
+        if f.get("kind") != "cylinder":
+            continue
+        origin, axis, radius = f.get("origin"), f.get("axis"), f.get("radius")
+        if not (isinstance(origin, list) and isinstance(axis, list) and _is_num(radius)):
+            continue
+        if want_radius is not None and abs(float(radius) - float(want_radius)) > _BORE_TOL:
+            continue
+        if abs(_point_axis_distance(near, origin, axis) - float(radius)) > _BORE_TOL:
+            continue
+        cylinders.append((int(f.get("i", -1)), origin, axis, float(radius)))
+    if not cylinders:
+        raise FeatureError(
+            "ref.bore_face %s matched no cylindrical face%s — check the point is ON the bore's "
+            "surface and, when given, that `radius` is that bore's radius."
+            % (list(near), "" if want_radius is None else " of radius %g m" % float(want_radius)),
+            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    if len(cylinders) > 1:
+        # Coaxial same-radius faces cannot be told apart by the anchor; the reader reports one
+        # face per connected surface, so this is a real ambiguity worth refusing.
+        raise FeatureError(
+            "ref.bore_face %s matched %d cylindrical faces (%s) — add 'radius' to pin which "
+            "coaxial bore is meant, or anchor the mouth edge directly."
+            % (list(near), len(cylinders), ", ".join("#%d r=%g" % (c[0], c[3])
+                                                     for c in cylinders[:4])),
+            code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
+    _fidx, origin, axis, radius = cylinders[0]
+
+    # The circles ON that cylinder: same axis line, same radius.
+    on_axis = []
+    for (i, c, n, r) in circles:
+        if abs(r - radius) > _BORE_TOL:
+            continue
+        if abs(abs(n[0] * axis[0] + n[1] * axis[1] + n[2] * axis[2]) - 1.0) > _AXIS_TOL:
+            continue
+        if _point_axis_distance(c, origin, axis) > _BORE_TOL:
+            continue
+        on_axis.append((i, c, n, r))
+    if not on_axis:
+        raise FeatureError(
+            "bore face #%d (r=%g m) has no circular edge on its own axis/radius — the bore's "
+            "mouth and bottom circles should be there; is the face a full cylinder?"
+            % (_fidx, radius),
+            code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+
+    # The mouth is the circle nearest the ANCHOR, projected on this cylinder's axis: a bore_face
+    # anchor is a point on the bore's surface, so the end it is written next to is the end the
+    # author means. That resolves a THROUGH bore's two equidistant ends (the interior rule ties
+    # on them by construction) and it also beats the interior rule on a COUNTERBORED blind bore,
+    # where the counterbore floor makes the pilot's bottom look "further out" than its mouth.
+    # The axis is passed as the axis_hint so the ranking never depends on the sign of a circle's
+    # reported normal (which is the curve's axis, sign arbitrary).
+    interior = _body_centroid(port, state_version, node_id, step)
+    # `on_axis` is by construction the circles of ONE cylinder (same axis, same radius), so a
+    # tie between two of them is that bore's two ENDS — a through bore, where either end is a
+    # valid mouth (end_type 2 threads the whole bore). Never raise there: pick deterministically.
+    _rank, idx, center, normal, _r = _pick_mouth(on_axis, interior, axis, node_id, step,
+                                                 "ref.bore_face %s" % list(near),
+                                                 entry_point=near, tie_is_one_bore=True)
+    return idx, {"edge_index": idx, "edge_center": center, "edge_normal": normal,
+                 "edge_radius": radius, "bore_face": _fidx,
+                 "matched": "bore_face (mouth rule)"}

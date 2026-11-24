@@ -14,11 +14,13 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "DSH_SOLIDWORKS_STATE_ROOT": "${CLAUDE_PLUGIN_DATA}/state",
-        "DSH_SOLIDWORKS_BACKUP_ROOT": "${CLAUDE_PLUGIN_DATA}/backups"
+        "DSH_SOLIDWORKS_BACKUP_ROOT": "${CLAUDE_PLUGIN_DATA}/backups",
+        "DSH_SOLIDWORKS_INTAKE_ROOT": "${CLAUDE_PLUGIN_DATA}/artifacts/intake",
+        "DSH_SOLIDWORKS_VIEWS_ROOT": "${CLAUDE_PLUGIN_DATA}/artifacts/views",
+        "DSH_SOLIDWORKS_SKILL_REFERENCES": "${CLAUDE_PLUGIN_ROOT}/skills/solidworks-cad/references"
       },
       "startup_timeout_sec": 300,
-      "tool_timeout_sec": 300
+      "tool_timeout_sec": 1800
     }
   }
 }
-
